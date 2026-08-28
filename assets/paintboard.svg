@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Paintboard">
+  <title>Paintboard</title>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- board: a wobbly rounded square, drawn by hand rather than with rect+rx -->
+    <path d="M56 15 C104 11, 156 11, 200 14
+             C224 16, 241 33, 242 57
+             C245 104, 245 154, 242 199
+             C241 224, 224 241, 199 243
+             C152 246, 102 246, 57 243
+             C32 241, 15 224, 14 199
+             C11 152, 11 102, 14 57
+             C15 32, 32 16, 56 15 Z"
+          fill="#ffffff" stroke="#1e1e1e" stroke-width="9"/>
+
+    <!-- placed shapes -->
+    <path d="M56 76 C76 72, 100 72, 118 76
+             C122 93, 122 116, 118 132
+             C99 136, 75 136, 56 132
+             C52 115, 52 92, 56 76 Z"
+          fill="#99e9f2" stroke="#0c8599" stroke-width="10"/>
+    <path d="M166 51 C190 52, 209 72, 208 96
+             C207 120, 187 139, 163 138
+             C139 137, 121 117, 122 93
+             C123 69, 142 50, 166 51 Z"
+          fill="#ffc9c9" stroke="#e03131" stroke-width="10"/>
+
+    <!-- pen stroke -->
+    <path d="M46 182 C72 152, 96 208, 123 178 C150 148, 176 202, 210 164"
+          stroke="#6965db" stroke-width="15"/>
+  </g>
+</svg>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Paintboard
+GenericName=Whiteboard
+Comment=Offline drawing board for sketches and diagrams
+Exec=paintboard %f
+Icon=paintboard
+Terminal=false
+StartupNotify=true
+StartupWMClass=paintboard
+Categories=Graphics;2DGraphics;VectorGraphics;
+Keywords=draw;paint;sketch;diagram;whiteboard;canvas;

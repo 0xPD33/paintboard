@@ -1,0 +1,18 @@
+paintboard bundles the following third party files.
+
+vendor/stb_truetype.h
+vendor/stb_image_write.h
+    stb single file libraries by Sean Barrett.
+    https://github.com/nothings/stb
+    Public domain, or MIT at your option. See the header of each file.
+
+vendor/Inter.ttf
+    Inter by Rasmus Andersson, used for the tool panel.
+    https://rsms.me/inter/
+    SIL Open Font License 1.1. See OFL.txt.
+
+vendor/Excalifont.ttf
+    Excalifont by Excalidraw, used for text on the canvas.
+    https://plus.excalidraw.com/excalifont
+    SIL Open Font License 1.1. See OFL.txt.
+    This is the Latin subset of the release, renamed.
