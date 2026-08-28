@@ -8,6 +8,8 @@ in a single file on disk.
 
 Excalidraw is the reference. This is the small offline version of it.
 
+![A release plan board open in Paintboard, with boxes, arrows, text, a freehand stroke, and the tool panel on the left](assets/screenshot.png)
+
 ## Features
 
 - Freehand pen, line, arrow, rectangle, ellipse, and text.
@@ -20,6 +22,8 @@ Excalidraw is the reference. This is the small offline version of it.
 - Infinite canvas with pan and zoom.
 - Save to a small binary file. Export the visible canvas to PNG.
 - Two fonts are built into the binary, so the program has no font setup.
+
+![A mind map in Paintboard, with a hand drawn red loop circling one of the boxes](assets/screenshot-mindmap.png)
 
 ## Install
 
