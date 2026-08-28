@@ -62,6 +62,9 @@ make install PREFIX=~/.local # or install for one user
 `make install` also writes the desktop entry and the icons, so Paintboard shows
 up in your application launcher.
 
+`nix develop` gives you a shell with the build tools and with `resvg`, which
+`make icon` uses to redraw `assets/paintboard.png` after you edit the logo.
+
 ## Use
 
 ```sh
