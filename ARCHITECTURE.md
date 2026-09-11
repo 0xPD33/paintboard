@@ -1,14 +1,17 @@
 # Architecture
 
-Paintboard is one C file of about 770 lines. It has no internal headers, no
-build system beyond a Makefile, and no runtime configuration. This document
+The board and GUI live in `paintboard.c`; `mcp.c` is included into the same
+translation unit and exposes those operations to agents. `collaboration.c`
+connects existing windows to clients; `paintboard-bridge` runs the local MCP
+proxy and the automatic agent watcher. Tool schemas are
+embedded from `mcp-tools.json`. The build uses a Makefile. This document
 explains the parts that are not obvious from reading the source top to bottom.
 
 ## Shape of the program
 
-`main` opens a GLFW window, bakes the fonts, loads the board, and then blocks in
-`glfwWaitEvents`. The program only redraws after an event arrives, so an idle
-board costs no CPU.
+`main` bakes the fonts, loads the board, opens a GLFW window at 85% of the
+primary monitor's work area, and then blocks in `glfwWaitEvents`. The program
+only redraws after an event arrives, so an idle board costs no CPU.
 
 Rendering uses the OpenGL fixed function pipeline. There are no shaders and no
 vertex buffers. Every frame walks the item array and emits quads. This is slow in
@@ -59,6 +62,11 @@ of `tpool`. This is safe because only the item being edited can own the tail.
 When you click an existing text item to edit it, `start_edit` copies its bytes to
 the end of the pool and repoints the item there, so the older snapshots keep
 looking at the original copy.
+
+Saving or exporting while typing commits that copy and starts a new edit copy,
+so continued typing cannot rewrite the saved/undo version. Finishing an empty
+new item cancels its creation; erasing existing text deletes it as an undoable
+edit.
 
 ### Pen scaling
 
@@ -169,8 +177,22 @@ walk does:
 
 So `if (button(...)) do_undo();` reads the same in both passes, and there is no
 widget list, no layout tree, and no chance of the drawn position and the clickable
-position drifting apart. A click below `PANEL_W` runs the hit test pass and
+position drifting apart. A click left of `panel_w()` runs the hit test pass and
 returns before the canvas ever sees the event.
+
+The walk works in logical pixels. One factor, `ui_s`, scales the whole panel,
+the custom agent dialog, the resize handles, and the hit tolerance. Each frame
+computes it from the GLFW content scale times the window-to-framebuffer ratio,
+which is what X11 with a DPI setting needs and what Wayland and macOS already
+apply, times the primary monitor's physical DPI over 96, clamped to 1x to 2.5x,
+which catches a 4K monitor left at compositor scale 1. `PAINTBOARD_UI_SCALE`
+multiplies on top. The draw pass runs under `glScalef(ui_s, ui_s, 1)`; the hit
+test pass divides the click by `ui_s` instead.
+
+When the panel is taller than the window, the wheel over the panel scrolls it.
+The draw pass translates by `-panel_scroll` and the hit test pass adds
+`panel_scroll` to the click, so the two passes stay aligned. `ui()` records its
+final `y` as the panel height, so a new widget needs no extra bookkeeping.
 
 ## File format
 
@@ -196,6 +218,12 @@ finite, and the pool slice fits inside the pool. A text item must also end at a
 NUL. A file that fails any check is rejected whole, and the program exits with a
 message rather than opening a half read board.
 
+Only a missing file starts an empty board. Other open errors abort startup.
+Saving writes to a unique temporary file in the destination directory, checks
+every write and flush, syncs the file, and renames it over the destination only
+after success. Existing file permissions are retained. A failed save reports an
+error and leaves the previous file intact.
+
 `PB02` files, which had no fill, no selection flag, and no pen scale, still load.
 The reader converts them through a small struct that matches the old layout and
 fills the new fields with defaults. They are written back as `PB03`.
@@ -206,6 +234,94 @@ Export re-renders the canvas with decorations off, reads the canvas region back
 with `glReadPixels`, and writes it with `stb_image_write`. It captures the visible
 area only. There is no offscreen framebuffer and no rendering of items outside the
 window.
+
+Export derives the extension from the basename, preserving dotted directory
+names and allocating enough space for the full path. A board already named
+`*.png` exports as `*.png.png` so the export cannot replace that board directly.
+
+## MCP server
+
+`--mcp` reserves stdout for newline-delimited JSON-RPC messages and exposes the
+live canvas through MCP tools. cJSON handles JSON parsing and serialization;
+`mcp-tools.json` supplies the discoverable input schemas. The server negotiates
+the protocol during initialization, waits for the initialized notification, and
+then accepts tool requests. Unknown requests get protocol errors; invalid tool
+arguments, stale revisions, busy edits, and I/O failures return tool errors.
+
+The input thread reads bounded messages and hands them to the main thread through
+a mutex-protected queue, using `glfwPostEmptyEvent` to wake the existing event
+loop. Only the main thread touches items, undo snapshots, pools, or OpenGL.
+Requests arriving during a human drag or text edit return a busy error. On stdin
+EOF the app saves and exits; when the window closes, the reader thread is stopped
+before GLFW is terminated. The stdio mode does not listen on a TCP port.
+
+Items retain the PB03 layout. Agents address them by array index paired with a
+monotonic session revision, which changes on checkpoints and history restores.
+This prevents stale edits after human actions, deletions, or undo. Add/update
+batches stage all items first and create one checkpoint only after validation;
+failed batches roll back unused pool tails. Agent edits share normal GUI undo.
+Reads paginate through the item array, and exports return a PNG path plus an
+inline image preview when the file is at most 32 MiB.
+
+`--mcp --headless` runs the same dispatcher synchronously without GLFW startup.
+It bakes fonts for text measurement and supports all tools except canvas images and PNG export.
+`make test` runs the board regression tests and Python stdio integration tests;
+the same protocol suite can target a live display with `PAINTBOARD_TEST_LIVE=1`.
+
+## Live collaboration
+
+Each normal window starts with collaboration off. A local socket in the
+owner-only `/tmp/paintboard-<uid>/` directory lets clients attach to the existing
+window. A socket reader queues requests for the main thread and wakes GLFW;
+it never changes board or GL state. The proxy handles its own MCP lifecycle, so
+several clients can use the same window without sharing initialization state.
+Disconnecting a client does not end the drawing session.
+
+The UI toggle gates board reads and mutations at the C tool dispatcher. Only
+status/discovery is available while off. Turning on launches a Python watcher for the selected agent;
+turning off increments a collaboration epoch and terminates the watcher process
+group, including a running CLI child. Changing agents also advances the epoch and
+cancels pending work; Chat only retains manual tool access without a watcher.
+Discovery runs in a separate Python process at startup and on refresh, checking
+PATH, common user install directories, and explicit executable overrides. Its
+results return through the local socket and are applied on the main thread.
+Every automatic response supplies both
+its snapshot revision and epoch for an atomic check before adding its items.
+
+Human checkpoints advance a separate `human_revision`; MCP mutations do not.
+History restores change the main revision but do not request another response.
+The watcher waits for a 1.5-second pause after editing ends, takes board data and
+a canvas image, then invokes the selected CLI in an isolated temporary directory.
+Codex uses `exec` with a read-only sandbox, a JSON schema, and user configuration
+disabled. Claude Code uses streaming image input and schema-constrained output,
+safe mode, and no built-in tools or MCP servers. OpenCode receives the image as
+a file attachment, JSON event output, and a configuration overlay denying tools.
+All adapters use saved authentication and convert replies to the same annotations.
+The automatic session is not given the chat's conversation history.
+
+The Custom slot stores one command and transport in the user's XDG config
+directory. The dialog uses separate draft state so typing does not edit the
+canvas; saving replaces the config atomically and rescans the executable.
+Commands are parsed with `shlex`, resolved through the same executable search,
+and launched as an argument array. File/prompt placeholders expand after parsing.
+Command mode feeds either the prompt or a versioned JSON request through stdin,
+and reads annotation JSON from stdout or a bounded output file.
+
+ACP mode implements v1 JSON-RPC over stdio: initialize, check image capability,
+create a temporary session, send image and prompt, and collect text message
+chunks until `end_turn`. It advertises no file or terminal services, declines
+permission requests, bounds protocol messages and output, and checks drawing
+revision and timeout while reading and writing the pipes. Stale work sends
+`session/cancel` and stops the process. ACP transport does not sandbox an agent's
+own tools; custom agents retain their CLI's authentication and permission setup.
+
+The watcher checks for new edits while waiting and discards stale work. It
+validates the returned annotations and adds them as one normal undo step. Own
+responses do not advance `human_revision`, preventing response loops. A failed
+request is shown in the panel and retried only after another human edit or a
+toggle. Image capture uses an anonymous temporary file and does not overwrite
+the user's PNG export. Collaboration invokes a networked model; drawing itself
+remains offline.
 
 ## Deliberate limits
 
@@ -221,3 +337,6 @@ The source marks its shortcuts with `ponytail:` comments. The ones that matter:
 - Text editing appends at the end only. There is no caret movement and no
   selection inside a text item.
 - PNG export is limited to the visible area.
+- The UI scale reads the primary monitor's DPI once at startup. A window moved
+  to a monitor with a different DPI keeps that scale; `PAINTBOARD_UI_SCALE` is
+  the override.

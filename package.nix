@@ -1,17 +1,26 @@
-{ lib, stdenv, pkg-config, glfw, libGL }:
+{ lib, stdenv, pkg-config, glfw, libGL, cjson, python3 }:
 
 stdenv.mkDerivation {
   pname = "paintboard";
-  version = "0.1.0";
+  version = "0.2.0";
 
-  src = lib.cleanSource ./.;
+  src = lib.cleanSourceWith {
+    src = ./.;
+    filter = path: type:
+      lib.cleanSourceFilter path type
+      && !(type == "regular" && baseNameOf path == "paintboard");
+  };
 
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ glfw libGL ];
+  nativeBuildInputs = [ pkg-config python3 ];
+  buildInputs = [ glfw libGL cjson ];
+  nativeCheckInputs = [ python3 ];
 
-  makeFlags = [ "PREFIX=$(out)" ];
+  makeFlags = [ "PREFIX=$(out)" "PYTHON=${python3}/bin/python3" ];
+  postInstall = ''
+    patchShebangs $out/bin/paintboard-bridge
+  '';
 
-  # The self test never opens a window, so it runs fine in the sandbox.
+  # Unit and MCP stdio tests run without a window.
   doCheck = true;
   checkTarget = "test";
 

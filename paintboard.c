@@ -1,10 +1,16 @@
-/* paintboard: offline Excalidraw-ish board. C23 + GLFW + legacy OpenGL, one file. */
+/* paintboard: offline Excalidraw-ish board. C23 + GLFW + legacy OpenGL + MCP. */
 #include <GLFW/glfw3.h>
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "vendor/stb_truetype.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -14,7 +20,7 @@
 #error "paintboard needs C23 #embed: build with gcc 15 or newer, or clang 19 or newer"
 #endif
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 #define APP_ID "paintboard" /* must match the desktop entry file name, or launchers lose the icon */
 
 static const unsigned char TTF_UI[] = {
@@ -58,11 +64,40 @@ static Font ui_font, canvas_font;
 static GLFWwindow *win;
 
 static int tool = PEN, color, fillc = -1, snap, editing = -1, drag, handle, panning, winh;
+static int editing_new, suppress_char;
 static float width = 3, panx, pany, zoom = 1, pressx, pressy, sbase[4];
 static Item *base; /* undo-top snapshot that a move/resize is re-derived from on every motion */
 static double lastx, lasty;
 static const char *path;
+static unsigned long revision, human_revision, collaboration_epoch;
+static int collaborating, agent_mutation;
+static char collaboration_status[64] = "Off";
+static void collaboration_toggle(void);
+static void collaboration_select(void), collaboration_discover(void);
+#define NAGENTS 4
+#define CUSTOM_AGENT 3
+static const char *agent_ids[NAGENTS] = {"codex", "claude", "opencode", "custom"};
+static const char *agent_labels[NAGENTS] = {"Codex", "Claude Code", "OpenCode", "Custom"};
+static char agent_paths[NAGENTS][4096];
+static int selected_agent = -2, agent_scanning;
+static const char *custom_transports[] = {"acp", "command", "json"};
+static const char *custom_transport_labels[] = {"ACP (standard agent protocol)", "Command: prompt on stdin", "Command: JSON request on stdin"};
+static char custom_command[4096], custom_draft[4096], custom_error[128];
+static int custom_transport, custom_draft_transport, custom_dialog, custom_cursor, custom_select_all;
+static void custom_save(void);
+static void changed(void) { revision++; if (!agent_mutation) human_revision++; }
 static int ui_mode; static float ui_x, ui_y; /* 0 = draw the panel, 1 = hit-test a click at (ui_x, ui_y) */
+/* Panel geometry is in logical px scaled by ui_s (monitor DPI, times PAINTBOARD_UI_SCALE). */
+static float ui_s = 1, ui_user_scale = 1, panel_scroll, panel_h = 800; static int ui_hover;
+static float panel_w(void) { return PANEL_W * ui_s; }
+static float monitor_dpi_scale(void) { /* logical px per inch over 96; catches 4K monitors left at compositor scale 1 */
+    GLFWmonitor *m = glfwGetPrimaryMonitor(); const GLFWvidmode *mode = m ? glfwGetVideoMode(m) : NULL;
+    int mmw, mmh; float csx = 1, csy;
+    if (!mode) return 1;
+    glfwGetMonitorPhysicalSize(m, &mmw, &mmh); glfwGetMonitorContentScale(m, &csx, &csy);
+    if (mmw <= 0) return 1;
+    return fminf(fmaxf(mode->width / csx / (mmw / 25.4f) / 96, 1), 2.5f);
+}
 
 static void *grow(void *p, int *cap, int need, size_t sz) {
     if (need <= *cap) return p;
@@ -84,9 +119,11 @@ static Snap snapshot(void) {
 static void restore(Snap s) {
     items = grow(items, &capitems, s.n + 1, sizeof *items);
     memcpy(items, s.it, s.n * sizeof(Item));
-    nitems = s.n; free(s.it);
+    /* Undo is feedback, not a request to regenerate the annotation just removed. */
+    nitems = s.n; free(s.it); revision++;
 }
 static void checkpoint(void) { /* call before every mutation */
+    changed();
     if (nundo == MAX_UNDO) { free(undo[0].it); memmove(undo, undo + 1, --nundo * sizeof *undo); }
     undo[nundo++] = snapshot();
     while (nredo) free(redo[--nredo].it);
@@ -110,7 +147,7 @@ static void font_upload(Font *f, const unsigned char *bmp) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, 1024, 1024, 0, GL_ALPHA, GL_UNSIGNED_BYTE, bmp);
 }
 static unsigned char atlas[2][1024 * 1024];
-static void fonts_bake(void) { font_bake(&ui_font, TTF_UI, 32, atlas[0]); font_bake(&canvas_font, TTF_CANVAS, 48, atlas[1]); }
+static void fonts_bake(void) { font_bake(&ui_font, TTF_UI, 40, atlas[0]); font_bake(&canvas_font, TTF_CANVAS, 48, atlas[1]); }
 static void fonts_upload(void) { font_upload(&ui_font, atlas[0]); font_upload(&canvas_font, atlas[1]); }
 static int utf8_next(const char **s) { /* codepoint, or '?' outside the atlas; never runs past a NUL */
     const unsigned char *p = (const unsigned char *)*s;
@@ -164,7 +201,7 @@ static void bbox(const Item *it, float *b) {
 static int hit(float wx, float wy) {
     for (int i = nitems - 1; i >= 0; i--) {
         const Item *it = &items[i];
-        float tol = it->width / 2 + 6 / zoom, b[4], ax, ay, bx, by;
+        float tol = it->width / 2 + 6 * ui_s / zoom, b[4], ax, ay, bx, by;
         switch (it->type) {
         case PEN:
             pen_pt(it, 0, &ax, &ay);
@@ -196,8 +233,8 @@ static int sel_bbox(float *b) {
     return n;
 }
 static int sel_frame(float *b) { /* selection box with room for stroke width and handles */
-    int n = sel_bbox(b); float m = 6 / zoom;
-    for (int i = 0; i < nitems; i++) if (items[i].sel) m = fmaxf(m, items[i].width / 2 + 6 / zoom);
+    int n = sel_bbox(b); float m = 6 * ui_s / zoom;
+    for (int i = 0; i < nitems; i++) if (items[i].sel) m = fmaxf(m, items[i].width / 2 + 6 * ui_s / zoom);
     b[0] -= m; b[1] -= m; b[2] += m; b[3] += m;
     return n;
 }
@@ -223,12 +260,17 @@ static void start_edit(int i) { /* re-append the bytes at the tail so older snap
     Item *it = &items[i]; int old = it->p0;
     tpool = grow(tpool, &captpool, ntpool + it->np + 2, 1);
     memcpy(tpool + ntpool, tpool + old, it->np);
-    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i; measure(it);
+    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i;
+    editing_new = nundo && i >= undo[nundo - 1].n; measure(it);
 }
 static void end_edit(void) {
     if (editing < 0) return;
     if (items[editing].np) ntpool++;   /* commit the NUL */
-    else restore(undo[--nundo]);      /* empty text = cancel */
+    else if (editing_new) restore(undo[--nundo]); /* cancel a new empty item */
+    else { /* erasing existing text is an undoable deletion */
+        memmove(items + editing, items + editing + 1, (nitems - editing - 1) * sizeof *items);
+        nitems--;
+    }
     editing = -1;
 }
 
@@ -374,7 +416,7 @@ static void draw_item(const Item *it) {
 static void draw_grid(int ww) {
     float g = GRID;
     while (g * zoom < 14) g *= 5;
-    float x0 = floorf((PANEL_W - panx) / zoom / g) * g, x1 = (ww - panx) / zoom;
+    float x0 = floorf((panel_w() - panx) / zoom / g) * g, x1 = (ww - panx) / zoom;
     float y0 = floorf(-pany / zoom / g) * g, y1 = (winh - pany) / zoom;
     hex(0xd9d9d9); glPointSize(2);
     glBegin(GL_POINTS);
@@ -390,7 +432,7 @@ static void draw_selection(void) {
         float ib[4]; bbox(&items[i], ib); outline(ib, items[i].width / 2 + 3 / zoom, 1 / zoom);
     }
     outline(b, 0, 1.5f / zoom);
-    float cx[4] = { b[0], b[2], b[2], b[0] }, cy[4] = { b[1], b[1], b[3], b[3] }, h = HANDLE / zoom, e = 1 / zoom;
+    float cx[4] = { b[0], b[2], b[2], b[0] }, cy[4] = { b[1], b[1], b[3], b[3] }, h = HANDLE * ui_s / zoom, e = 1 / zoom;
     for (int k = 0; k < 4; k++) {
         hex(ACCENT); fill(cx[k] - h - e, cy[k] - h - e, 2 * (h + e), 2 * (h + e));
         hex(0xffffff); fill(cx[k] - h, cy[k] - h, 2 * h, 2 * h);
@@ -422,17 +464,44 @@ static void render_canvas(int ww, int decorated) {
 }
 
 /* ---- file: "PB03" nitems npool ntpool items[] pool[] tpool[] ---- */
-static void save(void) {
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror(path); return; }
-    fwrite("PB03", 4, 1, f); fwrite(&nitems, 4, 1, f); fwrite(&npool, 4, 1, f); fwrite(&ntpool, 4, 1, f);
-    fwrite(items, sizeof(Item), nitems, f); fwrite(pool, sizeof(float), npool, f); fwrite(tpool, 1, ntpool, f);
-    fclose(f);
+static int write_board(FILE *f) {
+    return fwrite("PB03", 4, 1, f) == 1 && fwrite(&nitems, 4, 1, f) == 1
+        && fwrite(&npool, 4, 1, f) == 1 && fwrite(&ntpool, 4, 1, f) == 1
+        && fwrite(items, sizeof(Item), nitems, f) == (size_t)nitems
+        && fwrite(pool, sizeof(float), npool, f) == (size_t)npool
+        && fwrite(tpool, 1, ntpool, f) == (size_t)ntpool && fflush(f) == 0;
+}
+static int save(void) {
+    struct stat st;
+    int exists = stat(path, &st) == 0;
+    if (!exists && errno != ENOENT) { perror(path); return -1; }
+    /* Resolve existing symlinks so atomic replacement still saves their target. */
+    char *target = exists ? realpath(path, NULL) : strdup(path);
+    if (!target) { perror(path); return -1; }
+    const char *slash = strrchr(target, '/');
+    size_t dirlen = slash ? (size_t)(slash - target + 1) : 0;
+    char *tmp = malloc(dirlen + sizeof ".paintboard-XXXXXX");
+    if (!tmp) { free(target); perror(path); return -1; }
+    memcpy(tmp, target, dirlen); memcpy(tmp + dirlen, ".paintboard-XXXXXX", sizeof ".paintboard-XXXXXX");
+    int fd = mkstemp(tmp), ok = 0, err = errno;
+    if (fd >= 0) {
+        FILE *f = fdopen(fd, "wb");
+        if (f) {
+            ok = (!exists || fchmod(fd, st.st_mode & 0777) == 0) && write_board(f) && fsync(fd) == 0;
+            err = errno;
+            if (fclose(f) != 0) { ok = 0; err = errno; }
+            if (ok && rename(tmp, target) != 0) { ok = 0; err = errno; }
+        } else { err = errno; close(fd); }
+        if (!ok) unlink(tmp);
+    }
+    free(tmp); free(target);
+    if (!ok) { errno = err ? err : EIO; perror(path); return -1; }
+    return 0;
 }
 typedef struct { int type, color; float x0, y0, x1, y1, width; int p0, np; } ItemV2; /* PB02 layout */
-static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt */
-    FILE *f = fopen(path, "rb"); char magic[4]; int n = 0, np = 0, nt = 0;
-    if (!f) return 0;
+static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt, -2 open error */
+    FILE *f = fopen(path, "rb"); char magic[4] = {0}; int n = 0, np = 0, nt = 0;
+    if (!f) { if (errno == ENOENT) return 0; perror(path); return -2; }
     int v2 = fread(magic, 4, 1, f) == 1 && !memcmp(magic, "PB02", 4);
     int ok = (v2 || !memcmp(magic, "PB03", 4))
              && fread(&n, 4, 1, f) == 1 && fread(&np, 4, 1, f) == 1 && fread(&nt, 4, 1, f) == 1
@@ -444,7 +513,7 @@ static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt */
         if (v2) {
             ItemV2 *o = malloc((n + 1) * sizeof *o);
             ok = fread(o, sizeof *o, n, f) == (size_t)n;
-            for (int i = 0; i < n; i++)
+            for (int i = 0; ok && i < n; i++)
                 items[i] = (Item){ .type = o[i].type, .color = o[i].color, .fill = -1, .x0 = o[i].x0, .y0 = o[i].y0,
                                    .x1 = o[i].x1, .y1 = o[i].y1, .width = o[i].width, .sx = 1, .sy = 1, .p0 = o[i].p0, .np = o[i].np };
             free(o);
@@ -466,25 +535,48 @@ static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt */
     for (int i = 0; i < n; i++) if (items[i].type == TEXT) measure(&items[i]); /* font metrics may differ from the saving build */
     return 0;
 }
-static void export_png(void) { /* ponytail: exports the visible canvas area; pan/zoom to frame it */
+static char *png_path(const char *board) {
+    const char *name = strrchr(board, '/'); name = name ? name + 1 : board;
+    const char *ext = strrchr(name, '.');
+    size_t n = ext && ext != name ? (size_t)(ext - board) : strlen(board);
+    /* A board named *.png must not be overwritten by its own export. */
+    if (ext && !strcmp(ext, ".png")) n = strlen(board);
+    char *out = malloc(n + 5);
+    if (out) { memcpy(out, board, n); memcpy(out + n, ".png", 5); }
+    return out;
+}
+static int write_png(FILE *f, const unsigned char *pixels, int w, int h) {
+    int len;
+    unsigned char *png = stbi_write_png_to_mem(pixels, w * 3, w, h, 3, &len);
+    int ok = png && fwrite(png, 1, len, f) == (size_t)len && fflush(f) == 0;
+    free(png); return ok;
+}
+static int export_png(void) { /* ponytail: exports the visible canvas area; pan/zoom to frame it */
     int fw, fh, ww, wh; glfwGetFramebufferSize(win, &fw, &fh); glfwGetWindowSize(win, &ww, &wh);
-    int x = PANEL_W * fw / ww, W = fw - x;
+    if (ww <= panel_w() || wh <= 0 || fw <= 0 || fh <= 0) { fprintf(stderr, "no visible canvas to export\n"); return -1; }
+    int x = panel_w() * fw / ww, W = fw - x;
+    winh = wh;
     glViewport(0, 0, fw, fh); render_canvas(ww, 0);
     unsigned char *px = malloc((size_t)W * fh * 3);
+    char *out = png_path(path);
+    if (!px || !out) { free(px); free(out); fprintf(stderr, "export: out of memory\n"); return -1; }
     glPixelStorei(GL_PACK_ALIGNMENT, 1); glReadPixels(x, 0, W, fh, GL_RGB, GL_UNSIGNED_BYTE, px);
-    char out[512]; const char *dot = strrchr(path, '.');
-    snprintf(out, sizeof out, "%.*s.png", (int)(dot ? dot - path : (long)strlen(path)), path);
     stbi_flip_vertically_on_write(1);
-    printf(stbi_write_png(out, W, fh, 3, px, W * 3) ? "exported %s\n" : "export failed: %s\n", out);
-    free(px);
+    FILE *f = fopen(out, "wb");
+    int ok = f && write_png(f, px, W, fh);
+    if (f && fclose(f) != 0) ok = 0;
+    fprintf(stderr, ok ? "exported %s\n" : "export failed: %s\n", out);
+    free(px); free(out); return ok ? 0 : -1;
 }
 
 /* ---- panel: immediate-mode; the same walk draws (ui_mode 0) or hit-tests a click (ui_mode 1) ---- */
 static int inside(float x, float y, float w, float h, float px, float py) { return px >= x && px < x + w && py >= y && py < y + h; }
 static int button(float x, float y, float w, float h, const char *name, const char *key, int active) {
-    if (ui_mode) return inside(x, y, w, h, ui_x, ui_y);
+    int hover = inside(x, y, w, h, ui_x, ui_y);
+    if (ui_mode) return hover;
+    ui_hover |= hover;
     hex(active ? ACCENT : 0xdee2e6); rrect(x - 1, y - 1, w + 2, h + 2, 7);
-    hex(active ? 0xe0dfff : inside(x, y, w, h, lastx, lasty) ? 0xf1f3f5 : 0xffffff); rrect(x, y, w, h, 6);
+    hex(active ? 0xe0dfff : hover ? 0xf1f3f5 : 0xffffff); rrect(x, y, w, h, 6);
     float tx = key ? x + 12 : x + (w - text_w(&ui_font, 13, name)) / 2;
     text_draw(&ui_font, tx, y + (h - 13 * 1.25f) / 2, 13, INK, name);
     if (key) text_draw(&ui_font, x + w - 10 - text_w(&ui_font, 11, key), y + (h - 11 * 1.25f) / 2, 11, MUTED, key);
@@ -492,15 +584,99 @@ static int button(float x, float y, float w, float h, const char *name, const ch
 }
 static int swatch(float x, float y, unsigned col, int active) {
     if (ui_mode) return inside(x, y, 24, 24, ui_x, ui_y);
+    ui_hover |= inside(x, y, 24, 24, ui_x, ui_y);
     if (active) { hex(ACCENT); rrect(x - 4, y - 4, 32, 32, 9); hex(0xf8f9fa); rrect(x - 2, y - 2, 28, 28, 8); }
     else { hex(0xdee2e6); rrect(x - 1, y - 1, 26, 26, 7); }
     hex(col); rrect(x, y, 24, 24, 6);
     return 0;
 }
 static void section(float y, const char *s) { if (!ui_mode) text_draw(&ui_font, 12, y, 10, MUTED, s); }
+static void custom_open(void) {
+    strcpy(custom_draft, custom_command); custom_draft_transport = custom_transport;
+    custom_cursor = strlen(custom_draft); custom_select_all = 0; custom_dialog = 1;
+}
+static void custom_insert(const char *text, size_t size) {
+    size_t length = custom_select_all ? 0 : strlen(custom_draft);
+    if (length + size >= sizeof custom_draft) { strcpy(custom_error, "Command is too long"); return; }
+    for (size_t i = 0; i < size; i++) if ((unsigned char)text[i] < 32) { strcpy(custom_error, "Enter a single-line command"); return; }
+    if (custom_select_all) { *custom_draft = 0; custom_cursor = 0; custom_select_all = 0; }
+    memmove(custom_draft + custom_cursor + size, custom_draft + custom_cursor, length - custom_cursor + 1);
+    memcpy(custom_draft + custom_cursor, text, size); custom_cursor += size; *custom_error = 0;
+}
+static void custom_key(GLFWwindow *w, int key, int mods) {
+    int control = mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER);
+    if (key == GLFW_KEY_ESCAPE) { custom_dialog = 0; return; }
+    if (key == GLFW_KEY_ENTER) { custom_save(); return; }
+    if (control && key == GLFW_KEY_A) { custom_select_all = 1; return; }
+    if (control && key == GLFW_KEY_C) { if (custom_select_all) glfwSetClipboardString(w, custom_draft); return; }
+    if (control && key == GLFW_KEY_V) { const char *s = glfwGetClipboardString(w); if (s) custom_insert(s, strlen(s)); return; }
+    if (key == GLFW_KEY_TAB) { custom_draft_transport = (custom_draft_transport + 1) % 3; return; }
+    if (key == GLFW_KEY_HOME) custom_cursor = 0;
+    else if (key == GLFW_KEY_END) custom_cursor = strlen(custom_draft);
+    else if (key == GLFW_KEY_LEFT && custom_cursor) {
+        do custom_cursor--; while (custom_cursor && (custom_draft[custom_cursor] & 0xc0) == 0x80);
+    } else if (key == GLFW_KEY_RIGHT && custom_draft[custom_cursor]) {
+        do custom_cursor++; while ((custom_draft[custom_cursor] & 0xc0) == 0x80);
+    } else if (key == GLFW_KEY_BACKSPACE || key == GLFW_KEY_DELETE) {
+        if (custom_select_all) { *custom_draft = 0; custom_cursor = 0; }
+        else if (key == GLFW_KEY_BACKSPACE && custom_cursor) {
+            int end = custom_cursor;
+            do custom_cursor--; while (custom_cursor && (custom_draft[custom_cursor] & 0xc0) == 0x80);
+            memmove(custom_draft + custom_cursor, custom_draft + end, strlen(custom_draft + end) + 1);
+        } else if (key == GLFW_KEY_DELETE && custom_draft[custom_cursor]) {
+            int end = custom_cursor;
+            do end++; while ((custom_draft[end] & 0xc0) == 0x80);
+            memmove(custom_draft + custom_cursor, custom_draft + end, strlen(custom_draft + end) + 1);
+        }
+    } else return;
+    custom_select_all = 0;
+}
+static void custom_ui(void) {
+    int pw, ph; glfwGetWindowSize(win, &pw, &ph);
+    float ww = pw / ui_s, wh = ph / ui_s;
+    float w = fminf(680, ww - 24), x = (ww - w) / 2, y = fmaxf(12, (wh - 340) / 2);
+    if (!ui_mode) {
+        hexa(0x000000, .25f); fill(0, 0, ww, wh);
+        hex(0xf8f9fa); rrect(x, y, w, 340, 12);
+        text_draw(&ui_font, x + 20, y + 16, 20, INK, "Custom agent");
+        text_draw(&ui_font, x + 20, y + 54, 12, MUTED, "Launch command (use the agent's non-interactive or ACP command)");
+        hex(ACCENT); rrect(x + 19, y + 77, w - 38, 36, 5);
+        hex(custom_select_all ? 0xe0dfff : 0xffffff); rrect(x + 20, y + 78, w - 40, 34, 4);
+        char visible[4096]; strcpy(visible, custom_draft); visible[custom_cursor] = 0;
+        int start = 0;
+        while (text_w(&ui_font, 13, visible + start) > w - 64 && start < custom_cursor) {
+            do start++; while ((visible[start] & 0xc0) == 0x80);
+        }
+        float caret = text_w(&ui_font, 13, visible + start);
+        strcpy(visible, custom_draft + start);
+        while (*visible && text_w(&ui_font, 13, visible) > w - 60) {
+            size_t n = strlen(visible) - 1;
+            while (n && (visible[n] & 0xc0) == 0x80) n--;
+            visible[n] = 0;
+        }
+        text_draw(&ui_font, x + 28, y + 85, 13, *custom_draft ? INK : MUTED,
+                  *custom_draft ? visible : "e.g. my-agent acp");
+        hex(ACCENT); fill(x + 28 + caret, y + 84, 1, 20);
+        const char *help = custom_draft_transport == 0
+            ? "ACP v1: sends the canvas image and reads the streamed reply.\nThe agent must support images. Sign in with its CLI first."
+            : "Return annotation JSON on stdout or write it to {output}.\nArguments: {image}, {prompt}, {prompt_file}, {schema}, {board}\nQuotes group arguments. Commands run without an implicit shell.";
+        text_draw(&ui_font, x + 20, y + 170, 12, MUTED, help);
+        text_draw(&ui_font, x + 20, y + 236, 12, *custom_error ? 0xe03131 : MUTED,
+                  *custom_error ? custom_error : "Saved for future windows. Empty the command to remove it.");
+    }
+    if (button(x + 20, y + 126, w - 40, 30, custom_transport_labels[custom_draft_transport], ">", 0))
+        custom_draft_transport = (custom_draft_transport + 1) % 3;
+    if (button(x + w - 256, y + 284, 100, 32, "Cancel", NULL, 0)) custom_dialog = 0;
+    if (button(x + w - 144, y + 284, 124, 32, "Save & use", NULL, 1)) custom_save();
+}
 static void ui(void) {
-    float y = 12; char buf[24];
-    if (!ui_mode) { hex(0xf8f9fa); fill(0, 0, PANEL_W, winh); hex(0xe9ecef); fill(PANEL_W - 1, 0, 1, winh); }
+    float y = 12, vis = winh / ui_s; char buf[24];
+    panel_scroll = fminf(fmaxf(panel_scroll, 0), fmaxf(0, panel_h - vis));
+    ui_y += panel_scroll;
+    if (!ui_mode) {
+        glPushMatrix(); glTranslatef(0, -panel_scroll, 0);
+        hex(0xf8f9fa); fill(0, panel_scroll, PANEL_W, vis); hex(0xe9ecef); fill(PANEL_W - 1, panel_scroll, 1, vis);
+    }
     for (int t = 0; t < NTOOLS; t++, y += 32) if (button(8, y, 152, 28, TOOL_NAME[t], TOOL_KEY[t], tool == t)) tool = t;
     y += 4; section(y, "STROKE"); y += 18;
     for (int c = 0; c < NCOLORS; c++) if (swatch(24 + c % 4 * 32, y + c / 4 * 32, STROKE[c], c == color)) set_color(c);
@@ -531,11 +707,49 @@ static void ui(void) {
     y += 36;
     snprintf(buf, sizeof buf, "Zoom %d%%", (int)(zoom * 100 + .5f));
     if (button(8, y, 152, 28, buf, "0", 0)) { panx = pany = 0; zoom = 1; }
+    y += 36;
+    if (button(8, y, 152, 28, collaborating ? "Collaborate: On" : "Collaborate: Off", NULL, collaborating)) collaboration_toggle();
+    y += 36; section(y, "AUTO REPLY"); y += 18;
+    const char *label = selected_agent == -2 ? "Detecting..." : selected_agent < 0 ? "Chat only" : agent_labels[selected_agent];
+    if (button(8, y, 92, 28, label, NULL, 0)) collaboration_select();
+    if (button(104, y, 24, 28, "+", NULL, custom_dialog)) custom_open();
+    if (button(132, y, 28, 28, agent_scanning ? "..." : "R", NULL, 0)) collaboration_discover();
+    if (!ui_mode) {
+        char status[64]; snprintf(status, sizeof status, "%s", collaboration_status);
+        /* Keep status text inside the sidebar; full errors remain in get_status. */
+        while (*status && text_w(&ui_font, 10, status) > 152) status[strlen(status) - 1] = 0;
+        text_draw(&ui_font, 8, y + 34, 10, MUTED, status);
+        if (panel_h > vis) { /* scroll thumb */
+            hex(0xced4da); rrect(PANEL_W - 5, panel_scroll + panel_scroll / panel_h * vis, 3, vis / panel_h * vis, 1.5f);
+        }
+        glPopMatrix();
+    }
+    panel_h = y + 52;
+    ui_y -= panel_scroll;
+}
+static void hint_bar(int ww) { /* one-line context help along the bottom of the canvas */
+    static const char *tool_hint[NTOOLS] = {
+        "Drag to draw", "Drag to draw a line", "Drag to draw an arrow", "Drag to draw a rectangle", "Drag to draw an ellipse",
+        "Click to type, click text to edit it", "Click or drag a box to select" };
+    char s[160]; int n = nsel();
+    if (editing >= 0) snprintf(s, sizeof s, "Enter newline  ·  Esc done  ·  [ ] text size");
+    else if (tool == SELECT && n) snprintf(s, sizeof s, "%d selected  ·  drag to move, corners resize  ·  Del  ·  Ctrl+D duplicate", n);
+    else snprintf(s, sizeof s, "%s%s  ·  right drag pan  ·  wheel zoom", tool_hint[tool], snap ? "  ·  grid snap on" : "");
+    float w = text_w(&ui_font, 11, s) + 20, x = PANEL_W + 12, y = winh / ui_s - 30;
+    if (x + w > ww / ui_s) return;
+    hexa(0xffffff, .85f); rrect(x, y, w, 22, 6);
+    text_draw(&ui_font, x + 10, y + 4, 11, MUTED, s);
 }
 
 /* ---- input ---- */
 static void on_button(GLFWwindow *w, int button, int action, int mods) {
     double sx, sy; glfwGetCursorPos(w, &sx, &sy);
+    if (custom_dialog) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+            ui_mode = 1; ui_x = sx / ui_s; ui_y = sy / ui_s; custom_ui(); ui_mode = 0;
+        }
+        return;
+    }
     float wx = (sx - panx) / zoom, wy = (sy - pany) / zoom, b[4]; int shift = mods & GLFW_MOD_SHIFT;
     if (button != GLFW_MOUSE_BUTTON_LEFT) { panning = action == GLFW_PRESS; return; }
     if (action == GLFW_RELEASE) {
@@ -554,13 +768,14 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
         return;
     }
     end_edit();
-    if (sx < PANEL_W) { ui_mode = 1; ui_x = sx; ui_y = sy; ui(); ui_mode = 0; return; }
+    if (sx < panel_w()) { ui_mode = 1; ui_x = sx / ui_s; ui_y = sy / ui_s; ui(); ui_mode = 0; return; }
     pressx = wx; pressy = wy; base = NULL;
     if (tool == SELECT) {
         if (sel_frame(b)) {
             float cx[4] = { b[0], b[2], b[2], b[0] }, cy[4] = { b[1], b[1], b[3], b[3] };
             for (int k = 0; k < 4; k++) {
-                if (fabsf(cx[k] * zoom + panx - sx) > HANDLE + 3 || fabsf(cy[k] * zoom + pany - sy) > HANDLE + 3) continue;
+                float grab = HANDLE * ui_s + 3;
+                if (fabsf(cx[k] * zoom + panx - sx) > grab || fabsf(cy[k] * zoom + pany - sy) > grab) continue;
                 checkpoint(); base = undo[nundo - 1].it; sel_bbox(sbase); handle = k; drag = RESIZE;
                 return;
             }
@@ -593,6 +808,7 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
 }
 static void on_cursor(GLFWwindow *w, double sx, double sy) {
     float dx = sx - lastx, dy = sy - lasty; lastx = sx; lasty = sy;
+    if (custom_dialog) return;
     float wx = (sx - panx) / zoom, wy = (sy - pany) / zoom;
     if (panning) { panx += dx; pany += dy; }
     switch (drag) {
@@ -624,24 +840,45 @@ static void on_cursor(GLFWwindow *w, double sx, double sy) {
     }
     }
 }
+static void zoom_at(float sx, float sy, float by) { /* keep the point under (sx, sy) fixed */
+    float z = fminf(fmaxf(zoom * by, .05f), 50), f = z / zoom;
+    panx = sx - (sx - panx) * f; pany = sy - (sy - pany) * f; zoom = z;
+}
 static void on_scroll(GLFWwindow *w, double dx, double dy) {
+    if (custom_dialog) return;
     double sx, sy; glfwGetCursorPos(w, &sx, &sy);
-    float z = fminf(fmaxf(zoom * (dy > 0 ? 1.1f : 1 / 1.1f), .05f), 50), f = z / zoom;
-    panx = sx - (sx - panx) * f; pany = sy - (sy - pany) * f; zoom = z; /* keep the point under the cursor fixed */
+    if (sx < panel_w()) { panel_scroll -= dy * 40; return; }
+    zoom_at(sx, sy, dy > 0 ? 1.1f : 1 / 1.1f);
 }
 static void on_char(GLFWwindow *w, unsigned c) {
-    if (editing < 0 || c < 32) return;
+    int suppressed = suppress_char; suppress_char = 0;
+    if (suppressed && (c == '[' || c == ']')) return;
+    if ((!custom_dialog && editing < 0) || c < 32) return;
     char b[4]; int n = 0;
     if (c < 0x80) b[n++] = c;
     else if (c < 0x800) { b[n++] = 0xc0 | c >> 6; b[n++] = 0x80 | (c & 0x3f); }
     else if (c < 0x10000) { b[n++] = 0xe0 | c >> 12; b[n++] = 0x80 | (c >> 6 & 0x3f); b[n++] = 0x80 | (c & 0x3f); }
     else { b[n++] = 0xf0 | c >> 18; b[n++] = 0x80 | (c >> 12 & 0x3f); b[n++] = 0x80 | (c >> 6 & 0x3f); b[n++] = 0x80 | (c & 0x3f); }
-    text_put(b, n);
+    if (custom_dialog) custom_insert(b, n); else text_put(b, n);
 }
 static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
+    suppress_char = 0;
     if (action == GLFW_RELEASE) return;
+    if (custom_dialog) { custom_key(w, key, mods); return; }
     if (editing >= 0) {
-        if (key == GLFW_KEY_ESCAPE) end_edit();
+        if ((mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER)) && (key == GLFW_KEY_S || key == GLFW_KEY_E)) {
+            int i = items[editing].np ? editing : -1;
+            end_edit();
+            if (key == GLFW_KEY_S) save(); else export_png();
+            if (i >= 0) { checkpoint(); start_edit(i); }
+        }
+        else if (!(mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_ALT | GLFW_MOD_SHIFT))
+                 && (key == GLFW_KEY_LEFT_BRACKET || key == GLFW_KEY_RIGHT_BRACKET)) {
+            Item *it = &items[editing];
+            width = it->width = fminf(64, fmaxf(1, it->width + (key == GLFW_KEY_LEFT_BRACKET ? -1 : 1)));
+            measure(it); suppress_char = 1;
+        }
+        else if (key == GLFW_KEY_ESCAPE) end_edit();
         else if (key == GLFW_KEY_ENTER) text_put("\n", 1);
         else if (key == GLFW_KEY_BACKSPACE) text_del();
         return;
@@ -660,6 +897,10 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         case GLFW_KEY_C: copy_sel(); break;
         case GLFW_KEY_X: copy_sel(); delete_selected(); break;
         case GLFW_KEY_V: paste(wx, wy); break;
+        case GLFW_KEY_EQUAL: case GLFW_KEY_MINUS: {
+            int ww; glfwGetWindowSize(w, &ww, &winh);
+            zoom_at((panel_w() + ww) / 2, winh / 2.f, key == GLFW_KEY_EQUAL ? 1.25f : .8f); break;
+        }
         }
         return;
     }
@@ -682,7 +923,9 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
 }
 
 static int selftest(void) {
-    fonts_bake(); path = "paintboard-selftest.pb";
+    char dir[] = "/tmp/paintboard-test-XXXXXX", file[128];
+    assert(mkdtemp(dir)); snprintf(file, sizeof file, "%s/board.pb", dir);
+    fonts_bake(); path = file;
     assert(ui_font.cd['A' - 32].xadvance > 0 && canvas_font.cd['A' - 32].xadvance > 0);
     Item r = { .type = RECT, .color = 1, .fill = 2, .x0 = 10, .y0 = 10, .x1 = 50, .y1 = 40, .width = 3, .sx = 1, .sy = 1 };
     Item p = { .type = PEN, .fill = -1, .x0 = 100, .y0 = 100, .x1 = 100, .y1 = 100, .width = 3, .sx = 1, .sy = 1, .np = 2 };
@@ -705,38 +948,93 @@ static int selftest(void) {
     copy_sel(); delete_selected(); assert(nitems == 3 && nclip == 2);
     paste(300, 300); assert(nitems == 5 && items[3].x0 == 300 && items[4].x0 == 390);
     delete_selected(); assert(nitems == 3);
-    save(); nitems = npool = ntpool = 0;
+    assert(save() == 0); nitems = npool = ntpool = 0;
     assert(load() == 0 && nitems == 3 && npool == 4 && ntpool == 6 && !strcmp(tpool + items[2].p0, "h") && hit(125, 101) == 1);
-    remove(path); puts("ok");
+    /* A failed write must leave the last successfully saved board intact. */
+    pid_t child = fork(); assert(child >= 0);
+    if (!child) {
+        signal(SIGXFSZ, SIG_IGN);
+        struct rlimit limit = {1, 1}; assert(setrlimit(RLIMIT_FSIZE, &limit) == 0);
+        items[0].color = 7; _exit(save() == -1 ? 0 : 1);
+    }
+    int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(load() == 0 && items[0].color == 1);
+    char bad[160]; snprintf(bad, sizeof bad, "%s/child", file); path = bad;
+    assert(load() == -2); /* ENOTDIR is not a new board */
+    snprintf(bad, sizeof bad, "%s/missing.pb", dir); assert(load() == 0); path = file;
+    char *out = png_path("/tmp/project.v1/notes"); assert(!strcmp(out, "/tmp/project.v1/notes.png")); free(out);
+    out = png_path("/tmp/.notes"); assert(!strcmp(out, "/tmp/.notes.png")); free(out);
+    out = png_path("board.png"); assert(!strcmp(out, "board.png.png")); free(out);
+    char longpath[1024]; memset(longpath, 'a', 1020); memcpy(longpath + 1020, ".pb", 4);
+    out = png_path(longpath); assert(strlen(out) == 1024 && !strcmp(out + 1020, ".png")); free(out);
+    FILE *full = fopen("/dev/full", "wb"); unsigned char pixel[3] = {255, 255, 255};
+    assert(full && !write_png(full, pixel, 1, 1)); fclose(full);
+    checkpoint(); start_edit(2); text_del(); end_edit(); assert(nitems == 2);
+    unsigned long before_undo = human_revision;
+    do_undo(); assert(nitems == 3 && !strcmp(tpool + items[2].p0, "h") && human_revision == before_undo);
+    int before = nundo;
+    checkpoint(); t.p0 = ntpool; add_item(t); start_edit(3); end_edit();
+    assert(nitems == 3 && nundo == before);
+    checkpoint(); start_edit(2);
+    float oldwidth = items[2].width;
+    on_key(NULL, GLFW_KEY_RIGHT_BRACKET, 0, GLFW_PRESS, 0); on_char(NULL, ']');
+    assert(items[2].width == oldwidth + 1 && !strcmp(tpool + items[2].p0, "h"));
+    on_key(NULL, GLFW_KEY_S, 0, GLFW_PRESS, GLFW_MOD_CONTROL);
+    assert(editing == 2); text_put("!", 1); end_edit();
+    do_undo(); assert(!strcmp(tpool + items[2].p0, "h"));
+    assert(load() == 0 && !strcmp(tpool + items[2].p0, "h") && items[2].width == oldwidth + 1);
+    assert(remove(path) == 0 && rmdir(dir) == 0); puts("ok");
     return 0;
 }
 
 static void usage(FILE *f) {
     fprintf(f,
-        "usage: paintboard [FILE]\n"
+        "usage: paintboard [--mcp [--headless]] [FILE]\n"
         "  FILE defaults to board.pb and is created on exit if it does not exist.\n\n"
+        "  --mcp       expose this canvas to an MCP client over stdin/stdout\n"
+        "  --headless  run MCP without a window (PNG export unavailable)\n\n"
         "tools:  P pen  L line  A arrow  R rect  O ellipse  T text  V select\n"
         "select: click, shift+click, drag a box; drag to move, corner handles to resize\n"
         "edit:   Del delete  Ctrl+Z/Y undo/redo  Ctrl+A all  Ctrl+D duplicate  Ctrl+C/X/V copy/cut/paste\n"
         "style:  1-8 stroke color  [ ] width / text size  G snap to grid\n"
         "text:   click to type, Enter newline, Esc done; click existing text with T to edit\n"
-        "view:   right/middle drag pan  wheel zoom  0 reset\n"
-        "file:   Ctrl+S save (also on exit)  Ctrl+E export png\n");
+        "view:   right/middle drag pan  wheel zoom  Ctrl+= / Ctrl+- zoom  0 reset\n"
+        "file:   Ctrl+S save (also on exit)  Ctrl+E export png\n"
+        "env:    PAINTBOARD_UI_SCALE=1.5 scales the panel and handles on top of the monitor DPI\n");
 }
+
+#include "mcp.c"
+#include "collaboration.c"
 
 int main(int argc, char **argv) {
     items = grow(items, &capitems, 1, sizeof *items); pool = grow(pool, &cappool, 2, sizeof *pool); tpool = grow(tpool, &captpool, 2, 1);
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--mcp")) { mcp_mode = 1; continue; }
+        if (!strcmp(argv[i], "--headless")) { headless = 1; continue; }
         if (!strcmp(argv[i], "--test")) return selftest();
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         if (!strcmp(argv[i], "--version")) { puts("paintboard " VERSION); return 0; }
         if (argv[i][0] == '-') { fprintf(stderr, "unknown option: %s\n", argv[i]); usage(stderr); return 1; }
         path = argv[i];
     }
+    if (headless && !mcp_mode) { fprintf(stderr, "--headless requires --mcp\n"); return 1; }
     fonts_bake();
     if (!path) path = "board.pb";
-    if (load()) { fprintf(stderr, "%s: not a paintboard file\n", path); return 1; }
-    usage(stdout);
+    if (path[0] != '/') {
+        char *cwd = getcwd(NULL, 0), *absolute = malloc(strlen(cwd) + strlen(path) + 2);
+        sprintf(absolute, "%s/%s", cwd, path); free(cwd); path = absolute;
+    }
+    collaborating = mcp_mode; /* Explicit stdio sessions retain their existing opt-in. */
+    if (collaborating) strcpy(collaboration_status, "Agent tools connected");
+    int loaded = load();
+    if (loaded) { if (loaded == -1) fprintf(stderr, "%s: not a paintboard file\n", path); return 1; }
+    if (headless) {
+        if (mcp_start()) return 1;
+        char *line;
+        while (!mcp_output_failed && (line = mcp_read_line())) { mcp_dispatch(line); free(line); }
+        int saved = save(); cJSON_Delete(mcp_spec); return saved || mcp_output_failed ? 1 : 0;
+    }
+    if (!mcp_mode) usage(stdout);
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_SAMPLES, 4);
     /* Wayland compositors and X11 taskbars match this against the desktop entry to find the icon. */
@@ -744,23 +1042,44 @@ int main(int argc, char **argv) {
     glfwWindowHintString(GLFW_X11_CLASS_NAME, APP_ID);
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, APP_ID);
     char title[300]; snprintf(title, sizeof title, "paintboard - %s", path);
-    if (!(win = glfwCreateWindow(1280, 800, title, NULL, NULL))) return 1;
+    const char *env_scale = getenv("PAINTBOARD_UI_SCALE");
+    if (env_scale) ui_user_scale = fminf(fmaxf(atof(env_scale), .5f), 4);
+    /* Open at 85% of the work area so the window fits laptops and does not dwarf small monitors. */
+    int wx, wy, ww0 = 1280, wh0 = 800; GLFWmonitor *mon = glfwGetPrimaryMonitor();
+    if (mon) { glfwGetMonitorWorkarea(mon, &wx, &wy, &ww0, &wh0); ww0 = ww0 * .85f; wh0 = wh0 * .85f; }
+    if (!(win = glfwCreateWindow(ww0 > 400 ? ww0 : 400, wh0 > 300 ? wh0 : 300, title, NULL, NULL))) return 1;
+    glfwSetWindowSizeLimits(win, 400, 300, GLFW_DONT_CARE, GLFW_DONT_CARE);
     glfwMakeContextCurrent(win); glfwSwapInterval(1);
     glfwSetMouseButtonCallback(win, on_button); glfwSetCursorPosCallback(win, on_cursor);
     glfwSetScrollCallback(win, on_scroll); glfwSetKeyCallback(win, on_key); glfwSetCharCallback(win, on_char);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glEnable(GL_POINT_SMOOTH);
     fonts_upload();
     GLFWcursor *arrow = glfwCreateStandardCursor(GLFW_ARROW_CURSOR), *cross = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR),
-               *ibeam = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
+               *ibeam = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR), *hand = glfwCreateStandardCursor(GLFW_POINTING_HAND_CURSOR);
+    if (mcp_mode && mcp_start()) { glfwTerminate(); return 1; }
+    collaboration_start();
+    float dpi_scale = monitor_dpi_scale();
     while (!glfwWindowShouldClose(win)) {
+        collaboration_pump();
+        if (mcp_mode && mcp_pump()) break;
         int fw, fh, ww;
         glfwGetFramebufferSize(win, &fw, &fh); glfwGetWindowSize(win, &ww, &winh);
+        /* X11 reports DPI but sizes windows in physical px; Wayland and macOS already size in logical px. */
+        float csx, csy; glfwGetWindowContentScale(win, &csx, &csy);
+        ui_s = csx * ww / fw * dpi_scale * ui_user_scale;
         glViewport(0, 0, fw, fh);
         render_canvas(ww, 1);
-        glLoadIdentity(); ui();
-        glfwSetCursor(win, lastx < PANEL_W || tool == SELECT ? arrow : tool == TEXT ? ibeam : cross);
-        glfwSwapBuffers(win); glfwWaitEvents();
+        glLoadIdentity(); glScalef(ui_s, ui_s, 1);
+        ui_x = lastx / ui_s; ui_y = lasty / ui_s; ui_hover = 0;
+        ui(); hint_bar(ww);
+        if (custom_dialog) { ui_hover = 0; custom_ui(); }
+        glfwSetCursor(win, ui_hover ? hand : custom_dialog || lastx < panel_w() || tool == SELECT ? arrow : tool == TEXT ? ibeam : cross);
+        glfwSwapBuffers(win);
+        if (agent_scanning) glfwWaitEventsTimeout(.1); else glfwWaitEvents();
     }
-    end_edit(); save(); glfwTerminate();
-    return 0;
+    end_edit(); int saved = save();
+    collaboration_stop();
+    if (mcp_mode) mcp_stop();
+    glfwTerminate();
+    return saved || mcp_output_failed ? 1 : 0;
 }

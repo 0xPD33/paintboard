@@ -25,7 +25,7 @@
         {
           default = pkgs.mkShell {
             inputsFrom = [ self.packages.${system}.paintboard ];
-            packages = [ pkgs.resvg ];
+            packages = [ pkgs.resvg pkgs.python3 ];
           };
         });
     };

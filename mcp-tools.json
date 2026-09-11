@@ -1,0 +1,407 @@
+{
+  "itemSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": [
+          "pen",
+          "line",
+          "arrow",
+          "rect",
+          "ellipse",
+          "text"
+        ]
+      },
+      "x0": {
+        "type": "number",
+        "minimum": -1000000,
+        "maximum": 1000000
+      },
+      "y0": {
+        "type": "number",
+        "minimum": -1000000,
+        "maximum": 1000000
+      },
+      "x1": {
+        "type": "number",
+        "minimum": -1000000,
+        "maximum": 1000000
+      },
+      "y1": {
+        "type": "number",
+        "minimum": -1000000,
+        "maximum": 1000000
+      },
+      "width": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 64,
+        "default": 3
+      },
+      "color": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 7,
+        "default": 0,
+        "description": "Black, red, green, blue, orange, purple, teal, gray."
+      },
+      "fill": {
+        "type": "integer",
+        "minimum": -1,
+        "maximum": 7,
+        "default": -1,
+        "description": "Rectangle/ellipse fill palette index; -1 is transparent."
+      },
+      "text": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 65536,
+        "description": "UTF-8, at most 65536 bytes. Newlines allowed; other control characters are not."
+      },
+      "points": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 10000,
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000
+          }
+        },
+        "description": "Absolute world-coordinate [x,y] pairs for pen strokes."
+      }
+    },
+    "required": [
+      "type"
+    ],
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "const": "pen"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "points"
+          ]
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "const": "text"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "x0",
+            "y0",
+            "text"
+          ]
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "enum": [
+                "line",
+                "arrow",
+                "rect",
+                "ellipse"
+              ]
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "x0",
+            "y0",
+            "x1",
+            "y1"
+          ]
+        }
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "get_status",
+      "description": "Discover the open board, collaboration toggle, human revision, busy state, and agent status. Available even when collaboration is off.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_board",
+      "description": "Inspect the board, current revision, viewport, and items in back-to-front order. Item indices can change after edits: use this revision for update/delete/undo/redo. Coordinates are world units: screen = world * zoom + pan; the panel occupies the left 168 screen pixels. Paginate using next_offset and verify the revision stays the same.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 200
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "add_items",
+      "description": "Append up to 1000 items in paint order as one undo step. Returns their indices and the new revision. Defaults: black stroke, width 3, no fill. Text size is width * 7. Does not save automatically; call save_board when finished.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": {
+              "$ref": "#/$defs/item"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional expected revision. Supply with collaboration_epoch when responding to a snapshot."
+          },
+          "collaboration_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Reject the response if collaboration was toggled since the snapshot."
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "update_items",
+      "description": "Replace items at the supplied indices, atomically as one undo step. Supply COMPLETE item definitions, not patches. Use the revision from get_board or the last edit; stale revisions are rejected. Indices must be unique.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "item": {
+                  "$ref": "#/$defs/item"
+                }
+              },
+              "required": [
+                "index",
+                "item"
+              ]
+            }
+          }
+        },
+        "required": [
+          "revision",
+          "items"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "delete_items",
+      "description": "Delete the listed unique indices as one undo step. Requires the current revision. Remaining indices shift, so inspect the board again afterwards.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "indices": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "required": [
+          "revision",
+          "indices"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "undo",
+      "description": "Undo one action from the shared human/agent history. Requires the current revision.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "revision"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "redo",
+      "description": "Redo one action from the shared human/agent history. Requires the current revision.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "revision"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "save_board",
+      "description": "Atomically save to the board path selected when starting the server. Reports a tool error if saving fails.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "set_view",
+      "description": "Set pan and zoom to frame the live canvas before export. All three values are required. Does not alter board items or undo history.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "panx": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000
+          },
+          "pany": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000
+          },
+          "zoom": {
+            "type": "number",
+            "minimum": 0.05,
+            "maximum": 50
+          }
+        },
+        "required": [
+          "panx",
+          "pany",
+          "zoom"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "export_png",
+      "description": "Export the visible canvas without panel, grid, or selection decorations to a PNG beside the board. Returns its path and an image preview (up to 32 MiB). Requires a live window; unavailable in headless mode.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_canvas",
+      "description": "Read an image of the live visible canvas, without writing an export file. Returns revision and collaboration epoch with the image. Requires Collaborate on.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}
