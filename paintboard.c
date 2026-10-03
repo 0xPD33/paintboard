@@ -20,7 +20,7 @@
 #error "paintboard needs C23 #embed: build with gcc 15 or newer, or clang 19 or newer"
 #endif
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
 #define APP_ID "paintboard" /* must match the desktop entry file name, or launchers lose the icon */
 
 static const unsigned char TTF_UI[] = {
