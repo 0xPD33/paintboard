@@ -11,7 +11,11 @@
           "arrow",
           "rect",
           "ellipse",
-          "text"
+          "text",
+          "diamond",
+          "triangle",
+          "star",
+          "highlight"
         ]
       },
       "x0": {
@@ -52,7 +56,7 @@
         "minimum": -1,
         "maximum": 7,
         "default": -1,
-        "description": "Rectangle/ellipse fill palette index; -1 is transparent."
+        "description": "Fill palette index for rect, ellipse, diamond, triangle, and star; -1 is transparent."
       },
       "text": {
         "type": "string",
@@ -74,7 +78,7 @@
             "maximum": 1000000
           }
         },
-        "description": "Absolute world-coordinate [x,y] pairs for pen strokes."
+        "description": "Absolute world-coordinate [x,y] pairs for pen and highlight strokes."
       }
     },
     "required": [
@@ -85,7 +89,10 @@
         "if": {
           "properties": {
             "type": {
-              "const": "pen"
+              "enum": [
+                "pen",
+                "highlight"
+              ]
             }
           }
         },
@@ -119,7 +126,10 @@
                 "line",
                 "arrow",
                 "rect",
-                "ellipse"
+                "ellipse",
+                "diamond",
+                "triangle",
+                "star"
               ]
             }
           }

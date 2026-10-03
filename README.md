@@ -12,7 +12,8 @@ Excalidraw is the reference. This is the small offline version of it.
 
 ## Features
 
-- Freehand pen, line, arrow, rectangle, ellipse, and text.
+- Freehand pen, marker, line, arrow, rectangle, ellipse, diamond, triangle, star, and text.
+- Eraser that removes every item it touches. Empty shapes erase only at their outline.
 - Select one item, shift click to add more, or drag a box around a group.
 - Move a selection, or drag a corner handle to resize it.
 - Copy, cut, paste, and duplicate.
@@ -91,12 +92,17 @@ close it.
 | Key | Tool |
 | --- | --- |
 | `P` | Pen |
+| `H` | Marker (translucent highlighter) |
 | `L` | Line |
 | `A` | Arrow |
 | `R` | Rectangle |
 | `O` | Ellipse |
+| `D` | Diamond |
+| `I` | Triangle |
+| `S` | Star |
 | `T` | Text |
 | `V` | Select |
+| `E` | Eraser |
 
 ### Select and edit
 
@@ -114,24 +120,30 @@ close it.
 | `Ctrl+Y` or `Ctrl+Shift+Z` | Redo |
 | `Ctrl+D` | Duplicate |
 | `Ctrl+C`, `Ctrl+X`, `Ctrl+V` | Copy, cut, paste at the pointer |
+| `Ctrl+Shift+Del` or the Reset button | Clear the board and reset the view. `Ctrl+Z` brings the items back |
 
 ### Style
 
 | Key or action | Result |
 | --- | --- |
 | `1` to `8` | Set the stroke color |
-| `[` and `]` | Change the stroke width and the text size |
+| `[` and `]` | Change the stroke width, or the text size for text |
+| Panel `S`, `M`, `L`, `XL` | Pick a preset size for the current tool or the selection |
 | `G` | Turn grid snapping on or off |
 | Panel swatches | Set the stroke color and the fill color |
 
-A style key changes the current tool setting. If something is selected, it also
-changes the selection.
+Each tool keeps its own size, so the pen, the marker, and text do not share one
+width. A style key changes the current tool setting. If something is selected, it
+also changes the selection.
 
 ### Text
 
 Pick the text tool and click the canvas to start typing. Press `Enter` for a new
-line and `Esc` when you finish. Click an existing text item with the text tool to
-edit it again. Text grows and shrinks with `[` and `]`.
+line and `Esc` when you finish. Click an existing text item with the text tool,
+or double-click it with the select tool, to edit it again. The arrow keys, `Home`,
+and `End` move the caret, `Del` deletes forward, and `Ctrl+V` pastes. Text grows
+and shrinks with `[` and `]`. A click on the panel while you type ends the edit
+and selects the text, so a color or size click applies to it.
 These keys resize the text while typing. `Ctrl+S` saves and `Ctrl+E` exports
 without leaving text editing. Erasing all the text removes the item when you
 finish; undo restores it. Starting an empty item and finishing cancels it.
@@ -321,7 +333,7 @@ For example, the arguments to `add_items` can be:
 
 Coordinates are world units. At the default view, the tool panel covers the left
 168 logical pixels times the UI scale; `get_board` reports the window size.
-Pen items use absolute `[x, y]` pairs in `points`. Text uses
+Pen and highlight items use absolute `[x, y]` pairs in `points`. Text uses
 `x0`, `y0`, and `text`; the other shapes use two corners/endpoints. Stroke width
 defaults to 3 and text size is seven times the width. Color indices `0`–`7`
 follow the panel palette, and fill `-1` means transparent. Full schemas are

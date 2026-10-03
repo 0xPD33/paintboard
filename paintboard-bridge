@@ -369,7 +369,7 @@ def generate_response(endpoint, snapshot, agent="codex", executable=None, custom
     image = next(part for part in preview["content"] if part["type"] == "image")
     # The image describes freehand marks; avoid sending every sampled point as tokens.
     for entry in board["items"]:
-        if entry["item"]["type"] == "pen":
+        if entry["item"]["type"] in ("pen", "highlight"):
             entry["item"]["point_count"] = len(entry["item"].pop("points"))
     with tempfile.TemporaryDirectory(prefix="paintboard-agent-") as directory:
         directory = Path(directory)

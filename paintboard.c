@@ -30,8 +30,9 @@ static const unsigned char TTF_CANVAS[] = {
 #embed "vendor/Excalifont.ttf"
 };
 
-enum { PEN, LINE, ARROW, RECT, ELLIPSE, TEXT, SELECT, NTOOLS };
-enum { NONE, DRAW, MOVE, RESIZE, MARQUEE };
+/* Item types are saved in board files: append new ones before SELECT, never reorder. */
+enum { PEN, LINE, ARROW, RECT, ELLIPSE, TEXT, DIAMOND, TRIANGLE, STAR, HIGHLIGHT, SELECT, ERASER, NTOOLS };
+enum { NONE, DRAW, MOVE, RESIZE, MARQUEE, ERASE };
 #define NCOLORS 8
 #define MAX_UNDO 256
 #define PANEL_W 168
@@ -41,8 +42,10 @@ enum { NONE, DRAW, MOVE, RESIZE, MARQUEE };
 #define INK 0x1e1e1e
 #define MUTED 0x868e96
 
-static const char *TOOL_NAME[NTOOLS] = {"Pen", "Line", "Arrow", "Rectangle", "Ellipse", "Text", "Select"};
-static const char *TOOL_KEY[NTOOLS] = {"P", "L", "A", "R", "O", "T", "V"};
+static const char *TOOL_NAME[NTOOLS] = {"Pen", "Line", "Arrow", "Rect", "Ellipse", "Text", "Diamond", "Triangle", "Star", "Marker", "Select", "Eraser"};
+static const char *TOOL_KEY[NTOOLS] = {"P", "L", "A", "R", "O", "T", "D", "I", "S", "H", "V", "E"};
+static int is_pen(int t) { return t == PEN || t == HIGHLIGHT; }
+static int fillable(int t) { return t == RECT || t == ELLIPSE || t == DIAMOND || t == TRIANGLE || t == STAR; }
 static const unsigned STROKE[NCOLORS] = {0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c00, 0x9c36b5, 0x0c8599, 0x868e96};
 static const unsigned FILLC[NCOLORS] = {0xe9ecef, 0xffc9c9, 0xb2f2bb, 0xa5d8ff, 0xffec99, 0xeebefa, 0x99e9f2, 0xdee2e6};
 
@@ -66,6 +69,7 @@ static GLFWwindow *win;
 static int tool = PEN, color, fillc = -1, snap, editing = -1, drag, handle, panning, winh;
 static int editing_new, suppress_char;
 static float width = 3, panx, pany, zoom = 1, pressx, pressy, sbase[4];
+static float tool_width[NTOOLS] = { [0 ... NTOOLS - 1] = 3, [HIGHLIGHT] = 16 }; /* each tool remembers its own width or text size */
 static Item *base; /* undo-top snapshot that a move/resize is re-derived from on every motion */
 static double lastx, lasty;
 static const char *path;
@@ -193,32 +197,54 @@ static float seg_dist(float px, float py, float ax, float ay, float bx, float by
 static void bbox(const Item *it, float *b) {
     b[0] = fminf(it->x0, it->x1); b[1] = fminf(it->y0, it->y1);
     b[2] = fmaxf(it->x0, it->x1); b[3] = fmaxf(it->y0, it->y1);
-    for (int k = 0; it->type == PEN && k < it->np; k++) {
+    for (int k = 0; is_pen(it->type) && k < it->np; k++) {
         float x, y; pen_pt(it, k, &x, &y);
         b[0] = fminf(b[0], x); b[1] = fminf(b[1], y); b[2] = fmaxf(b[2], x); b[3] = fmaxf(b[3], y);
     }
 }
-static int hit(float wx, float wy) {
-    for (int i = nitems - 1; i >= 0; i--) {
-        const Item *it = &items[i];
-        float tol = it->width / 2 + 6 * ui_s / zoom, b[4], ax, ay, bx, by;
-        switch (it->type) {
-        case PEN:
-            pen_pt(it, 0, &ax, &ay);
-            if (it->np == 1 && hypotf(wx - ax, wy - ay) < tol) return i;
-            for (int k = 0; k + 1 < it->np; k++, ax = bx, ay = by) {
-                pen_pt(it, k + 1, &bx, &by);
-                if (seg_dist(wx, wy, ax, ay, bx, by) < tol) return i;
-            }
-            break;
-        case LINE: case ARROW:
-            if (seg_dist(wx, wy, it->x0, it->y0, it->x1, it->y1) < tol) return i;
-            break;
-        default: /* ponytail: bbox hit for rect/ellipse/text; switch to outline hit if nested shapes annoy */
-            bbox(it, b);
-            if (wx > b[0] - tol && wx < b[2] + tol && wy > b[1] - tol && wy < b[3] + tol) return i;
+static int poly(const Item *it, float *p) { /* closed outline of a fillable shape, at most 64 points */
+    float cx = (it->x0 + it->x1) / 2, cy = (it->y0 + it->y1) / 2, rx = fabsf(it->x1 - it->x0) / 2, ry = fabsf(it->y1 - it->y0) / 2;
+    switch (it->type) {
+    case RECT: memcpy(p, (float[]){ it->x0, it->y0, it->x1, it->y0, it->x1, it->y1, it->x0, it->y1 }, 8 * sizeof *p); return 4;
+    case DIAMOND: memcpy(p, (float[]){ cx, it->y0, it->x1, cy, cx, it->y1, it->x0, cy }, 8 * sizeof *p); return 4;
+    case TRIANGLE: memcpy(p, (float[]){ cx, it->y0, it->x1, it->y1, it->x0, it->y1 }, 6 * sizeof *p); return 3;
+    case STAR: /* a unit star spans x +-0.951 and y -1..0.809; stretch it to fill the box */
+        for (int i = 0; i < 10; i++) {
+            float a = -1.5708f + i * .62832f, r = i & 1 ? .4f : 1;
+            p[2 * i] = cx + rx / .951f * r * cosf(a); p[2 * i + 1] = fminf(it->y0, it->y1) + ry * 2 / 1.809f * (1 + r * sinf(a));
         }
+        return 10;
+    default:
+        for (int i = 0; i < 64; i++) { p[2 * i] = cx + rx * cosf(i * 0.09817f); p[2 * i + 1] = cy + ry * sinf(i * 0.09817f); }
+        return 64;
     }
+}
+static int touches(const Item *it, float wx, float wy, int edges) { /* edges: unfilled shapes count only their outline */
+    float tol = it->width / 2 + 6 * ui_s / zoom, b[4], ax, ay, bx, by, p[128];
+    switch (it->type) {
+    case PEN: case HIGHLIGHT:
+        pen_pt(it, 0, &ax, &ay);
+        if (it->np == 1 && hypotf(wx - ax, wy - ay) < tol) return 1;
+        for (int k = 0; k + 1 < it->np; k++, ax = bx, ay = by) {
+            pen_pt(it, k + 1, &bx, &by);
+            if (seg_dist(wx, wy, ax, ay, bx, by) < tol) return 1;
+        }
+        return 0;
+    case LINE: case ARROW:
+        return seg_dist(wx, wy, it->x0, it->y0, it->x1, it->y1) < tol;
+    case TEXT: break;
+    default:
+        if (!edges || it->fill >= 0) break;
+        for (int n = poly(it, p), k = 0; k < n; k++)
+            if (seg_dist(wx, wy, p[2 * k], p[2 * k + 1], p[2 * ((k + 1) % n)], p[2 * ((k + 1) % n) + 1]) < tol) return 1;
+        return 0;
+    }
+    /* ponytail: selection hits shapes by bbox; the eraser uses outlines so it can reach inside a frame */
+    bbox(it, b);
+    return wx > b[0] - tol && wx < b[2] + tol && wy > b[1] - tol && wy < b[3] + tol;
+}
+static int hit(float wx, float wy) {
+    for (int i = nitems - 1; i >= 0; i--) if (touches(&items[i], wx, wy, 0)) return i;
     return -1;
 }
 static int nsel(void) { int n = 0; for (int i = 0; i < nitems; i++) n += items[i].sel; return n; }
@@ -245,22 +271,31 @@ static void measure(Item *it) {
     float h, w = text_run(&canvas_font, 0, 0, tpx(it), tpool + it->p0, 0, &h);
     it->x1 = it->x0 + fmaxf(w, tpx(it) * .3f); it->y1 = it->y0 + h;
 }
-static void text_put(const char *b, int n) {
+static int caret; /* byte offset of the caret in the text being edited */
+static void text_put(const char *b, int n) { /* insert at the caret; the edited text is the pool tail */
     tpool = grow(tpool, &captpool, ntpool + n + 1, 1);
-    memcpy(tpool + ntpool, b, n); ntpool += n; tpool[ntpool] = 0;
+    char *s = tpool + items[editing].p0;
+    memmove(s + caret + n, s + caret, items[editing].np - caret); memcpy(s + caret, b, n);
+    ntpool += n; tpool[ntpool] = 0; caret += n;
     items[editing].np += n; measure(&items[editing]);
 }
-static void text_del(void) { /* drop one codepoint */
-    Item *it = &items[editing];
-    if (!it->np) return;
-    do { ntpool--; it->np--; } while (it->np && (tpool[ntpool] & 0xc0) == 0x80);
-    tpool[ntpool] = 0; measure(it);
+static int text_step(int at, int dir) { /* neighbouring codepoint boundary */
+    const char *s = tpool + items[editing].p0; int np = items[editing].np;
+    if (dir < 0 && at > 0) do at--; while (at && (s[at] & 0xc0) == 0x80);
+    if (dir > 0 && at < np) do at++; while (at < np && (s[at] & 0xc0) == 0x80);
+    return at;
 }
+static void text_cut(int a, int b) { /* remove bytes [a, b) and leave the caret at a */
+    Item *it = &items[editing]; char *s = tpool + it->p0;
+    memmove(s + a, s + b, it->np - b); it->np -= b - a; ntpool -= b - a;
+    tpool[ntpool] = 0; caret = a; measure(it);
+}
+static void text_del(void) { text_cut(text_step(caret, -1), caret); } /* backspace */
 static void start_edit(int i) { /* re-append the bytes at the tail so older snapshots keep their copy */
     Item *it = &items[i]; int old = it->p0;
     tpool = grow(tpool, &captpool, ntpool + it->np + 2, 1);
     memcpy(tpool + ntpool, tpool + old, it->np);
-    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i;
+    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i; caret = it->np;
     editing_new = nundo && i >= undo[nundo - 1].n; measure(it);
 }
 static void end_edit(void) {
@@ -321,10 +356,55 @@ static void set_color(int c) {
 static void set_fill(int c) {
     fillc = c;
     if (!nsel()) return;
-    checkpoint(); for (int i = 0; i < nitems; i++) if (items[i].sel && (items[i].type == RECT || items[i].type == ELLIPSE)) items[i].fill = c;
+    checkpoint(); for (int i = 0; i < nitems; i++) if (items[i].sel && fillable(items[i].type)) items[i].fill = c;
+}
+static void reset_board(void) { /* undoable, so a misclick costs one Ctrl+Z */
+    end_edit();
+    if (nitems) { checkpoint(); nitems = 0; }
+    panx = pany = 0; zoom = 1; drag = NONE;
+}
+static int erased; /* items removed by the current eraser drag; the first removal checkpoints */
+static void erase_at(float wx, float wy) {
+    for (int i = nitems - 1; i >= 0; i--) {
+        if (!touches(&items[i], wx, wy, 1)) continue;
+        if (!erased++) checkpoint();
+        memmove(items + i, items + i + 1, (nitems - i - 1) * sizeof *items); nitems--;
+    }
+}
+static void erase_path(float ax, float ay, float bx, float by) { /* sample so fast drags do not skip thin items */
+    int n = fminf(ceilf(hypotf(bx - ax, by - ay) * zoom / 4), 1000);
+    for (int k = 1; k <= n; k++) erase_at(ax + (bx - ax) * k / n, ay + (by - ay) * k / n);
+}
+static void smooth_stroke(Item *it) { /* a finished stroke owns the pool tail, so rewriting it keeps snapshots valid */
+    float *p = pool + it->p0;
+    for (int pass = 0; pass < 3; pass++) {
+        float px = p[0], py = p[1];
+        for (int k = 1; k + 1 < it->np; k++) { /* 1-2-1 average; ends stay put */
+            float x = p[2 * k], y = p[2 * k + 1];
+            p[2 * k] = (px + 2 * x + p[2 * k + 2]) / 4; p[2 * k + 1] = (py + 2 * y + p[2 * k + 3]) / 4;
+            px = x; py = y;
+        }
+    }
+}
+static void set_tool(int t) { tool = t; width = tool_width[t]; }
+static int width_kind(void) { /* TEXT, HIGHLIGHT, or PEN for any other stroke: picks the size label and presets */
+    int k = -1;
+    if (editing >= 0) return TEXT;
+    for (int i = 0; i < nitems; i++) {
+        if (!items[i].sel) continue;
+        int t = items[i].type == TEXT || items[i].type == HIGHLIGHT ? items[i].type : PEN;
+        if (k >= 0 && k != t) return PEN;
+        k = t;
+    }
+    return k >= 0 ? k : tool == TEXT || tool == HIGHLIGHT ? tool : PEN;
+}
+static float shown_width(void) { /* the edited or first selected item, else the tool default */
+    if (editing >= 0) return items[editing].width;
+    for (int i = 0; i < nitems; i++) if (items[i].sel) return items[i].width;
+    return width;
 }
 static void set_width(float w) {
-    width = fminf(fmaxf(w, 1), 32);
+    width = tool_width[tool] = fminf(fmaxf(w, 1), 64);
     if (!nsel()) return;
     checkpoint();
     for (int i = 0; i < nitems; i++) {
@@ -374,10 +454,15 @@ static void draw_item(const Item *it) {
     float w = it->width, buf[128];
     hex(STROKE[it->color]);
     switch (it->type) {
-    case PEN:
+    case PEN: case HIGHLIGHT:
         scratch = grow(scratch, &capscratch, 2 * it->np + 2, sizeof *scratch);
         for (int k = 0; k < it->np; k++) pen_pt(it, k, &scratch[2 * k], &scratch[2 * k + 1]);
+        if (it->type == HIGHLIGHT) { /* stencil paints each pixel once, so overlapping quads do not darken */
+            hexa(STROKE[it->color], .35f); glClear(GL_STENCIL_BUFFER_BIT); glEnable(GL_STENCIL_TEST);
+            glStencilFunc(GL_EQUAL, 0, 0xff); glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
+        }
         stroke(scratch, it->np, 0, w);
+        glDisable(GL_STENCIL_TEST);
         break;
     case LINE: case ARROW: {
         float l[4] = { it->x0, it->y0, it->x1, it->y1 };
@@ -390,22 +475,16 @@ static void draw_item(const Item *it) {
         }
         break;
     }
-    case RECT: {
-        float r[8] = { it->x0, it->y0, it->x1, it->y0, it->x1, it->y1, it->x0, it->y1 };
-        if (it->fill >= 0) { hex(FILLC[it->fill]); fill(it->x0, it->y0, it->x1 - it->x0, it->y1 - it->y0); hex(STROKE[it->color]); }
-        stroke(r, 4, 1, w);
-        break;
-    }
-    case ELLIPSE: {
-        float cx = (it->x0 + it->x1) / 2, cy = (it->y0 + it->y1) / 2;
-        float rx = fabsf(it->x1 - it->x0) / 2, ry = fabsf(it->y1 - it->y0) / 2;
-        for (int i = 0; i < 64; i++) { buf[2 * i] = cx + rx * cosf(i * 0.09817f); buf[2 * i + 1] = cy + ry * sinf(i * 0.09817f); }
-        if (it->fill >= 0) {
+    case RECT: case ELLIPSE: case DIAMOND: case TRIANGLE: case STAR: {
+        int n = poly(it, buf);
+        if (it->fill >= 0) { /* fan from the vertex mean: inside every shape here, since all are star-convex about it */
+            float mx = 0, my = 0;
+            for (int i = 0; i < n; i++) { mx += buf[2 * i] / n; my += buf[2 * i + 1] / n; }
             hex(FILLC[it->fill]);
-            glBegin(GL_TRIANGLE_FAN); for (int i = 0; i < 64; i++) glVertex2fv(buf + 2 * i); glEnd();
+            glBegin(GL_TRIANGLE_FAN); glVertex2f(mx, my); for (int i = 0; i <= n; i++) glVertex2fv(buf + 2 * (i % n)); glEnd();
             hex(STROKE[it->color]);
         }
-        stroke(buf, 64, 1, w);
+        stroke(buf, n, 1, w);
         break;
     }
     case TEXT:
@@ -440,10 +519,12 @@ static void draw_selection(void) {
 }
 static void draw_caret(void) {
     if (editing < 0) return;
-    const Item *it = &items[editing]; const char *s = tpool + it->p0, *nl = strrchr(s, '\n');
-    float px = tpx(it); int lines = 1;
+    const Item *it = &items[editing]; char *s = tpool + it->p0, keep = s[caret];
+    s[caret] = 0; /* measure only the text before the caret */
+    const char *nl = strrchr(s, '\n'); float px = tpx(it); int lines = 1;
     for (const char *p = s; *p; p++) lines += *p == '\n';
     float x = it->x0 + text_w(&canvas_font, px, nl ? nl + 1 : s) + 1, y = it->y0 + (lines - 1) * px * 1.25f;
+    s[caret] = keep;
     float c[4] = { x, y + px * .1f, x, y + px * 1.1f };
     hex(ACCENT); stroke(c, 2, 0, 1.5f / zoom);
 }
@@ -527,7 +608,7 @@ static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt, -2 ope
         ok = it->type >= 0 && it->type < SELECT && it->color >= 0 && it->color < NCOLORS && it->fill >= -1 && it->fill < NCOLORS
              && it->width >= 1 && it->width <= 64 && isfinite(it->x0) && isfinite(it->y0) && isfinite(it->x1) && isfinite(it->y1)
              && isfinite(it->sx) && isfinite(it->sy) && it->p0 >= 0 && it->np >= 0
-             && (it->type == PEN  ? it->p0 <= np && it->np <= (np - it->p0) / 2
+             && (is_pen(it->type) ? it->p0 <= np && it->np <= (np - it->p0) / 2
                : it->type == TEXT ? it->p0 < nt && it->np < nt - it->p0 && !tpool[it->p0 + it->np] : 1);
     }
     if (!ok) return -1;
@@ -677,29 +758,43 @@ static void ui(void) {
         glPushMatrix(); glTranslatef(0, -panel_scroll, 0);
         hex(0xf8f9fa); fill(0, panel_scroll, PANEL_W, vis); hex(0xe9ecef); fill(PANEL_W - 1, panel_scroll, 1, vis);
     }
-    for (int t = 0; t < NTOOLS; t++, y += 32) if (button(8, y, 152, 28, TOOL_NAME[t], TOOL_KEY[t], tool == t)) tool = t;
-    y += 4; section(y, "STROKE"); y += 18;
+    static const int order[NTOOLS] = { SELECT, ERASER, PEN, HIGHLIGHT, LINE, ARROW, RECT, ELLIPSE, DIAMOND, TRIANGLE, STAR, TEXT };
+    for (int k = 0; k < NTOOLS; k++) if (button(8 + k % 2 * 80, y + k / 2 * 32, 72, 28, TOOL_NAME[order[k]], NULL, tool == order[k])) set_tool(order[k]);
+    y += (NTOOLS + 1) / 2 * 32 + 4; section(y, "STROKE"); y += 18;
     for (int c = 0; c < NCOLORS; c++) if (swatch(24 + c % 4 * 32, y + c / 4 * 32, STROKE[c], c == color)) set_color(c);
     y += 70; section(y, "FILL"); y += 18;
     if (swatch(8, y, 0xffffff, fillc < 0)) set_fill(-1);
     if (!ui_mode) { hex(0xe03131); seg(14, y + 18, 26, y + 6, 2); }
     for (int c = 0; c < NCOLORS; c++) if (swatch(8 + (c + 1) % 5 * 32, y + (c + 1) / 5 * 32, FILLC[c], c == fillc)) set_fill(c);
-    y += 70; section(y, "STROKE WIDTH / TEXT SIZE"); y += 18;
-    if (button(8, y, 28, 28, "-", NULL, 0)) set_width(width - 1);
+    static const float PRESET[3][4] = { { 2, 3, 5, 8 }, { 1, 3, 6, 12 }, { 8, 16, 24, 32 } }; /* text, stroke, marker */
+    static const char *PRESET_NAME[4] = { "S", "M", "L", "XL" };
+    int kind = width_kind(); float shown = shown_width();
+    y += 70; section(y, kind == TEXT ? "TEXT SIZE" : kind == HIGHLIGHT ? "MARKER WIDTH" : "STROKE WIDTH"); y += 18;
+    if (button(8, y, 28, 28, "-", NULL, 0)) set_width(shown - 1);
     if (!ui_mode) {
-        hex(STROKE[color]); seg(46, y + 14, 94, y + 14, fminf(width, 16));
-        snprintf(buf, sizeof buf, "%g", width);
-        text_draw(&ui_font, 112 - text_w(&ui_font, 12, buf) / 2, y + 6, 12, INK, buf);
+        if (kind == TEXT) {
+            float px = fminf(shown * 7, 26);
+            text_draw(&canvas_font, 66 - text_w(&canvas_font, px, "Aa") / 2, y + 14 - px * .6f, px, STROKE[color], "Aa");
+            snprintf(buf, sizeof buf, "%gpx", shown * 7);
+        } else {
+            if (kind == HIGHLIGHT) hexa(STROKE[color], .35f); else hex(STROKE[color]);
+            seg(46, y + 14, 86, y + 14, fminf(shown, 24));
+            snprintf(buf, sizeof buf, "%g", shown);
+        }
+        text_draw(&ui_font, 108 - text_w(&ui_font, 12, buf) / 2, y + 6, 12, INK, buf);
     }
-    if (button(132, y, 28, 28, "+", NULL, 0)) set_width(width + 1);
-    y += 36;
+    if (button(132, y, 28, 28, "+", NULL, 0)) set_width(shown + 1);
+    y += 32;
+    const float *preset = PRESET[kind == TEXT ? 0 : kind == HIGHLIGHT ? 2 : 1];
+    for (int k = 0; k < 4; k++) if (button(8 + k * 39, y, 35, 26, PRESET_NAME[k], NULL, shown == preset[k])) set_width(preset[k]);
+    y += 34;
     if (button(8, y, 152, 28, "Snap to grid", "G", snap)) snap ^= 1;
     y += 36;
     if (button(8, y, 72, 28, "Undo", NULL, 0)) do_undo();
     if (button(88, y, 72, 28, "Redo", NULL, 0)) do_redo();
     y += 32;
     if (button(8, y, 72, 28, "Delete", NULL, 0)) delete_selected();
-    if (button(88, y, 72, 28, "Clear", NULL, 0)) { checkpoint(); nitems = 0; }
+    if (button(88, y, 72, 28, "Reset", NULL, 0)) reset_board();
     y += 32;
     if (button(8, y, 152, 28, "Export PNG", "Ctrl+E", 0)) export_png();
     y += 32;
@@ -730,11 +825,12 @@ static void ui(void) {
 static void hint_bar(int ww) { /* one-line context help along the bottom of the canvas */
     static const char *tool_hint[NTOOLS] = {
         "Drag to draw", "Drag to draw a line", "Drag to draw an arrow", "Drag to draw a rectangle", "Drag to draw an ellipse",
-        "Click to type, click text to edit it", "Click or drag a box to select" };
-    char s[160]; int n = nsel();
-    if (editing >= 0) snprintf(s, sizeof s, "Enter newline  ·  Esc done  ·  [ ] text size");
+        "Click to type, click text to edit it (or double-click it with Select)", "Drag to draw a diamond", "Drag to draw a triangle", "Drag to draw a star",
+        "Drag to highlight", "Click or drag a box to select", "Drag over items to erase  ·  Ctrl+Shift+Del resets the board" };
+    char s[200]; int n = nsel();
+    if (editing >= 0) snprintf(s, sizeof s, "Enter newline  ·  Esc done  ·  arrows, Home, End move  ·  [ ] text size  ·  Ctrl+V paste");
     else if (tool == SELECT && n) snprintf(s, sizeof s, "%d selected  ·  drag to move, corners resize  ·  Del  ·  Ctrl+D duplicate", n);
-    else snprintf(s, sizeof s, "%s%s  ·  right drag pan  ·  wheel zoom", tool_hint[tool], snap ? "  ·  grid snap on" : "");
+    else snprintf(s, sizeof s, "%s (%s)%s  ·  right drag pan  ·  wheel zoom", tool_hint[tool], TOOL_KEY[tool], snap ? "  ·  grid snap on" : "");
     float w = text_w(&ui_font, 11, s) + 20, x = PANEL_W + 12, y = winh / ui_s - 30;
     if (x + w > ww / ui_s) return;
     hexa(0xffffff, .85f); rrect(x, y, w, 22, 6);
@@ -754,8 +850,9 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
     if (button != GLFW_MOUSE_BUTTON_LEFT) { panning = action == GLFW_PRESS; return; }
     if (action == GLFW_RELEASE) {
         if (drag == DRAW) {
-            const Item *it = &items[nitems - 1];
-            if (it->type != PEN && it->x0 == it->x1 && it->y0 == it->y1) restore(undo[--nundo]); /* drop zero-size shape */
+            Item *it = &items[nitems - 1];
+            if (!is_pen(it->type) && it->x0 == it->x1 && it->y0 == it->y1) restore(undo[--nundo]); /* drop zero-size shape */
+            else if (is_pen(it->type)) smooth_stroke(it);
         }
         if (drag == MARQUEE) {
             float m[4] = { fminf(pressx, wx), fminf(pressy, wy), fmaxf(pressx, wx), fmaxf(pressy, wy) };
@@ -767,10 +864,18 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
         drag = NONE;
         return;
     }
+    int edited = editing >= 0 && items[editing].np ? editing : -1;
     end_edit();
-    if (sx < panel_w()) { ui_mode = 1; ui_x = sx / ui_s; ui_y = sy / ui_s; ui(); ui_mode = 0; return; }
+    if (sx < panel_w()) {
+        if (edited >= 0) { select_none(); items[edited].sel = 1; } /* panel styles then apply to the text just typed */
+        ui_mode = 1; ui_x = sx / ui_s; ui_y = sy / ui_s; ui(); ui_mode = 0; return;
+    }
     pressx = wx; pressy = wy; base = NULL;
     if (tool == SELECT) {
+        static double last_click; static int last_hit = -1;
+        int h = hit(wx, wy), twice = h >= 0 && h == last_hit && glfwGetTime() - last_click < .4;
+        last_hit = h; last_click = glfwGetTime();
+        if (twice && !shift && items[h].type == TEXT) { select_none(); checkpoint(); start_edit(h); last_hit = -1; return; }
         if (sel_frame(b)) {
             float cx[4] = { b[0], b[2], b[2], b[0] }, cy[4] = { b[1], b[1], b[3], b[3] };
             for (int k = 0; k < 4; k++) {
@@ -780,7 +885,6 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
                 return;
             }
         }
-        int h = hit(wx, wy);
         if (h >= 0) {
             if (shift) items[h].sel ^= 1;
             else if (!items[h].sel) { select_none(); items[h].sel = 1; }
@@ -793,17 +897,18 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
         return;
     }
     select_none();
+    if (tool == ERASER) { erased = 0; erase_at(wx, wy); drag = ERASE; return; }
     int h = tool == TEXT ? hit(wx, wy) : -1;
-    if (tool != PEN) { wx = snapf(wx); wy = snapf(wy); }
+    if (!is_pen(tool)) { wx = snapf(wx); wy = snapf(wy); }
     checkpoint();
-    Item it = { .type = tool, .color = color, .fill = tool == RECT || tool == ELLIPSE ? fillc : -1,
-                .x0 = wx, .y0 = wy, .x1 = wx, .y1 = wy, .width = width, .sx = 1, .sy = 1, .p0 = tool == TEXT ? ntpool : npool };
+    Item it = { .type = tool, .color = color, .fill = fillable(tool) ? fillc : -1, .x0 = wx, .y0 = wy, .x1 = wx, .y1 = wy,
+                .width = width, .sx = 1, .sy = 1, .p0 = tool == TEXT ? ntpool : npool };
     if (tool == TEXT) {
         if (h >= 0 && items[h].type == TEXT) start_edit(h);
         else { add_item(it); start_edit(nitems - 1); }
         return;
     }
-    if (tool == PEN) { add_pt(0, 0); it.np = 1; }
+    if (is_pen(tool)) { add_pt(0, 0); it.np = 1; }
     add_item(it); drag = DRAW;
 }
 static void on_cursor(GLFWwindow *w, double sx, double sy) {
@@ -812,10 +917,11 @@ static void on_cursor(GLFWwindow *w, double sx, double sy) {
     float wx = (sx - panx) / zoom, wy = (sy - pany) / zoom;
     if (panning) { panx += dx; pany += dy; }
     switch (drag) {
+    case ERASE: erase_path((sx - dx - panx) / zoom, (sy - dy - pany) / zoom, wx, wy); break;
     case DRAW: {
         Item *it = &items[nitems - 1];
         /* ponytail: drop points closer than 2px; immediate mode is the ceiling, VBOs if boards get huge */
-        if (it->type == PEN) {
+        if (is_pen(it->type)) {
             if (hypotf(wx - it->x0 - pool[npool - 2], wy - it->y0 - pool[npool - 1]) > 2 / zoom) { add_pt(wx - it->x0, wy - it->y0); it->np++; }
         } else { it->x1 = snapf(wx); it->y1 = snapf(wy); }
         break;
@@ -867,20 +973,31 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
     if (custom_dialog) { custom_key(w, key, mods); return; }
     if (editing >= 0) {
         if ((mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER)) && (key == GLFW_KEY_S || key == GLFW_KEY_E)) {
-            int i = items[editing].np ? editing : -1;
+            int i = items[editing].np ? editing : -1, at = caret;
             end_edit();
             if (key == GLFW_KEY_S) save(); else export_png();
-            if (i >= 0) { checkpoint(); start_edit(i); }
+            if (i >= 0) { checkpoint(); start_edit(i); caret = at; }
+        }
+        else if ((mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER)) && key == GLFW_KEY_V) {
+            const char *clip = glfwGetClipboardString(w); char *b = clip ? malloc(strlen(clip) + 1) : NULL; int n = 0;
+            for (const char *p = clip; b && *p; p++) if ((unsigned char)*p >= 32 || *p == '\n') b[n++] = *p;
+            if (n && items[editing].np + n <= 65536) text_put(b, n); /* same cap as MCP text */
+            free(b);
         }
         else if (!(mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_ALT | GLFW_MOD_SHIFT))
                  && (key == GLFW_KEY_LEFT_BRACKET || key == GLFW_KEY_RIGHT_BRACKET)) {
             Item *it = &items[editing];
-            width = it->width = fminf(64, fmaxf(1, it->width + (key == GLFW_KEY_LEFT_BRACKET ? -1 : 1)));
+            width = tool_width[TEXT] = it->width = fminf(64, fmaxf(1, it->width + (key == GLFW_KEY_LEFT_BRACKET ? -1 : 1)));
             measure(it); suppress_char = 1;
         }
         else if (key == GLFW_KEY_ESCAPE) end_edit();
         else if (key == GLFW_KEY_ENTER) text_put("\n", 1);
         else if (key == GLFW_KEY_BACKSPACE) text_del();
+        else if (key == GLFW_KEY_DELETE) text_cut(caret, text_step(caret, 1));
+        else if (key == GLFW_KEY_LEFT) caret = text_step(caret, -1);
+        else if (key == GLFW_KEY_RIGHT) caret = text_step(caret, 1);
+        else if (key == GLFW_KEY_HOME) while (caret && tpool[items[editing].p0 + caret - 1] != '\n') caret--;
+        else if (key == GLFW_KEY_END) while (caret < items[editing].np && tpool[items[editing].p0 + caret] != '\n') caret++;
         return;
     }
     if (key == GLFW_KEY_LEFT_SHIFT || key == GLFW_KEY_RIGHT_SHIFT) return;
@@ -892,11 +1009,12 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         case GLFW_KEY_Y: do_redo(); break;
         case GLFW_KEY_S: save(); break;
         case GLFW_KEY_E: export_png(); break;
-        case GLFW_KEY_A: for (int i = 0; i < nitems; i++) items[i].sel = 1; tool = SELECT; break;
+        case GLFW_KEY_A: for (int i = 0; i < nitems; i++) items[i].sel = 1; set_tool(SELECT); break;
         case GLFW_KEY_D: duplicate(); break;
         case GLFW_KEY_C: copy_sel(); break;
         case GLFW_KEY_X: copy_sel(); delete_selected(); break;
         case GLFW_KEY_V: paste(wx, wy); break;
+        case GLFW_KEY_DELETE: case GLFW_KEY_BACKSPACE: if (mods & GLFW_MOD_SHIFT) reset_board(); break;
         case GLFW_KEY_EQUAL: case GLFW_KEY_MINUS: {
             int ww; glfwGetWindowSize(w, &ww, &winh);
             zoom_at((panel_w() + ww) / 2, winh / 2.f, key == GLFW_KEY_EQUAL ? 1.25f : .8f); break;
@@ -905,19 +1023,24 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         return;
     }
     switch (key) {
-    case GLFW_KEY_P: tool = PEN; break;
-    case GLFW_KEY_L: tool = LINE; break;
-    case GLFW_KEY_A: tool = ARROW; break;
-    case GLFW_KEY_R: tool = RECT; break;
-    case GLFW_KEY_O: tool = ELLIPSE; break;
-    case GLFW_KEY_T: tool = TEXT; break;
-    case GLFW_KEY_V: tool = SELECT; break;
+    case GLFW_KEY_P: set_tool(PEN); break;
+    case GLFW_KEY_L: set_tool(LINE); break;
+    case GLFW_KEY_A: set_tool(ARROW); break;
+    case GLFW_KEY_R: set_tool(RECT); break;
+    case GLFW_KEY_O: set_tool(ELLIPSE); break;
+    case GLFW_KEY_T: set_tool(TEXT); break;
+    case GLFW_KEY_V: set_tool(SELECT); break;
+    case GLFW_KEY_D: set_tool(DIAMOND); break;
+    case GLFW_KEY_I: set_tool(TRIANGLE); break;
+    case GLFW_KEY_S: set_tool(STAR); break;
+    case GLFW_KEY_H: set_tool(HIGHLIGHT); break;
+    case GLFW_KEY_E: set_tool(ERASER); break;
     case GLFW_KEY_G: snap ^= 1; break;
     case GLFW_KEY_ESCAPE: select_none(); break;
     case GLFW_KEY_0: panx = pany = 0; zoom = 1; break;
     case GLFW_KEY_DELETE: case GLFW_KEY_BACKSPACE: delete_selected(); break;
-    case GLFW_KEY_LEFT_BRACKET: case GLFW_KEY_MINUS: set_width(width - 1); break;
-    case GLFW_KEY_RIGHT_BRACKET: case GLFW_KEY_EQUAL: set_width(width + 1); break;
+    case GLFW_KEY_LEFT_BRACKET: case GLFW_KEY_MINUS: set_width(shown_width() - 1); break;
+    case GLFW_KEY_RIGHT_BRACKET: case GLFW_KEY_EQUAL: set_width(shown_width() + 1); break;
     default: if (key >= GLFW_KEY_1 && key <= GLFW_KEY_8) set_color(key - GLFW_KEY_1);
     }
 }
@@ -993,11 +1116,14 @@ static void usage(FILE *f) {
         "  FILE defaults to board.pb and is created on exit if it does not exist.\n\n"
         "  --mcp       expose this canvas to an MCP client over stdin/stdout\n"
         "  --headless  run MCP without a window (PNG export unavailable)\n\n"
-        "tools:  P pen  L line  A arrow  R rect  O ellipse  T text  V select\n"
+        "tools:  P pen  H marker  L line  A arrow  R rect  O ellipse  D diamond  I triangle  S star\n"
+        "        T text  V select  E eraser\n"
         "select: click, shift+click, drag a box; drag to move, corner handles to resize\n"
         "edit:   Del delete  Ctrl+Z/Y undo/redo  Ctrl+A all  Ctrl+D duplicate  Ctrl+C/X/V copy/cut/paste\n"
+        "        Ctrl+Shift+Del reset the board (undoable)\n"
         "style:  1-8 stroke color  [ ] width / text size  G snap to grid\n"
-        "text:   click to type, Enter newline, Esc done; click existing text with T to edit\n"
+        "text:   click to type, Enter newline, Esc done, arrows/Home/End move, Ctrl+V paste;\n"
+        "        click existing text with T, or double-click it with V, to edit\n"
         "view:   right/middle drag pan  wheel zoom  Ctrl+= / Ctrl+- zoom  0 reset\n"
         "file:   Ctrl+S save (also on exit)  Ctrl+E export png\n"
         "env:    PAINTBOARD_UI_SCALE=1.5 scales the panel and handles on top of the monitor DPI\n");

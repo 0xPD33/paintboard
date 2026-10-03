@@ -8,7 +8,7 @@ static const char MCP_SPEC[] = {
 #embed "mcp-tools.json"
     , 0
 };
-static const char *ITEM_TYPE[] = {"pen", "line", "arrow", "rect", "ellipse", "text"};
+static const char *ITEM_TYPE[] = {"pen", "line", "arrow", "rect", "ellipse", "text", "diamond", "triangle", "star", "highlight"};
 static int mcp_mode, headless, mcp_phase, mcp_output_failed;
 static cJSON *mcp_spec;
 static pthread_mutex_t mcp_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -57,8 +57,8 @@ static cJSON *item_json(const Item *it) {
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "type", ITEM_TYPE[it->type]);
     cJSON_AddNumberToObject(r, "color", it->color); cJSON_AddNumberToObject(r, "width", it->width);
-    if (it->type == RECT || it->type == ELLIPSE) cJSON_AddNumberToObject(r, "fill", it->fill);
-    if (it->type == PEN) {
+    if (fillable(it->type)) cJSON_AddNumberToObject(r, "fill", it->fill);
+    if (is_pen(it->type)) {
         cJSON *points = cJSON_AddArrayToObject(r, "points");
         for (int k = 0; k < it->np; k++) {
             float x, y; pen_pt(it, k, &x, &y); double pair[2] = {x, y};
@@ -94,15 +94,15 @@ static int parse_item(const cJSON *o, Item *it) {
     *it = (Item){.type = -1, .fill = -1, .width = 3, .sx = 1, .sy = 1};
     for (int i = 0; i < SELECT; i++) if (jstr(field(o, "type"), ITEM_TYPE[i])) it->type = i;
     if (it->type < 0) return 0;
-    const char *allowed = it->type == PEN ? "|type|color|width|points|"
+    const char *allowed = is_pen(it->type) ? "|type|color|width|points|"
         : it->type == TEXT ? "|type|color|width|x0|y0|text|"
-        : it->type == RECT || it->type == ELLIPSE ? "|type|color|width|fill|x0|y0|x1|y1|" : "|type|color|width|x0|y0|x1|y1|";
+        : fillable(it->type) ? "|type|color|width|fill|x0|y0|x1|y1|" : "|type|color|width|x0|y0|x1|y1|";
     if (!keys(o, allowed)) return 0;
     const cJSON *v = field(o, "color");
     if (v) { if (!number(v, 0, 7, 1)) return 0; it->color = v->valueint; }
     v = field(o, "fill"); if (v) { if (!number(v, -1, 7, 1)) return 0; it->fill = v->valueint; }
     v = field(o, "width"); if (v) { if (!number(v, 1, 64, 0)) return 0; it->width = v->valuedouble; }
-    if (it->type == PEN) {
+    if (is_pen(it->type)) {
         const cJSON *pts = field(o, "points"); int n = cJSON_GetArraySize(pts);
         if (!cJSON_IsArray(pts) || n < 1 || n > 10000 || npool + 2 * n >= 1 << 26) return 0;
         it->p0 = npool; it->np = n;

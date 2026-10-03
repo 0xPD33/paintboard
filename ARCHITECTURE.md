@@ -57,8 +57,10 @@ the pools only grow, every index in every snapshot stays correct forever. Deleti
 an item leaks its pool entries, which is fine for a drawing session and saves the
 whole problem of tracking references.
 
-There is one mutation: while you type, `text_put` and `text_del` change the tail
-of `tpool`. This is safe because only the item being edited can own the tail.
+There are two mutations, and both touch only a pool tail that one new item owns.
+While you type, `text_put` and `text_cut` change the tail of `tpool` at the
+caret. When a pen or marker stroke ends, `smooth_stroke` averages the stroke's
+points in place at the tail of `pool`. No snapshot refers to those entries yet.
 When you click an existing text item to edit it, `start_edit` copies its bytes to
 the end of the pool and repoints the item there, so the older snapshots keep
 looking at the original copy.
@@ -123,8 +125,13 @@ reported reliably, so Paintboard does not use it. `seg` builds a quad for each
 segment and `dot` puts a filled circle at each join and each end. `stroke` walks a
 point list and calls both. Round joins come free from the dots.
 
-Ellipses are 64 segment polygons. Fills use a triangle fan for the ellipse and a
-single quad for the rectangle.
+`poly()` gives the outline of every closed shape. Ellipses are 64 segment
+polygons. Fills use a triangle fan from the mean of the vertices, which lies
+inside each shape because each shape is star-convex about that point.
+
+The marker draws its stroke at 35% opacity. The joins overlap, so a plain blend
+would darken them. The marker therefore uses the stencil buffer, so each pixel
+gets paint only once per stroke.
 
 ## Text
 
@@ -153,7 +160,12 @@ files are at runtime.
 the type:
 
 - Pen, line, and arrow use point to segment distance against every segment.
-- Rectangle, ellipse, and text use the bounding box.
+- Closed shapes and text use the bounding box.
+
+The eraser calls the same test with `edges` set. Then an unfilled shape counts
+only its outline, so you can erase the items inside a frame and keep the frame.
+A drag samples the path every four screen pixels, so a fast stroke does not skip
+thin items. The first removal in a drag creates the one undo step.
 
 The tolerance is half the stroke width plus six screen pixels, so thin lines stay
 easy to grab at any zoom.
@@ -332,10 +344,10 @@ The source marks its shortcuts with `ponytail:` comments. The ones that matter:
 - Whole array undo snapshots. Fine below roughly a hundred thousand items.
 - Bounding box hit testing for closed shapes. Outline testing would be better if
   nested shapes become annoying.
-- Pen points closer than two screen pixels are dropped while drawing. There is no
-  curve fitting or smoothing.
-- Text editing appends at the end only. There is no caret movement and no
-  selection inside a text item.
+- Pen points closer than two screen pixels are dropped while drawing. A finished
+  stroke gets three passes of a 1-2-1 average. There is no curve fitting.
+- The text caret moves only with the keyboard. A click does not place it, and
+  there is no selection inside a text item.
 - PNG export is limited to the visible area.
 - The UI scale reads the primary monitor's DPI once at startup. A window moved
   to a monitor with a different DPI keeps that scale; `PAINTBOARD_UI_SCALE` is
