@@ -190,6 +190,60 @@ static void collaboration_start(void) {
     if (collaborating) strcpy(collaboration_status, "Agent tools connected");
     collaboration_discover();
 }
+static void collaboration_answer(char *line, const char *error) { /* reply to one queued request and free it; the listener sends the reply */
+    char *reply = NULL; size_t len; FILE *output = open_memstream(&reply, &len);
+    if (output) {
+        int phase = mcp_phase, failed = mcp_output_failed; mcp_phase = 2; mcp_output = output;
+        cJSON *req = cJSON_Parse(line);
+        if (error) rpc_reply(field(req, "id"), tool_error(error), 0, NULL);
+        else if (jstr(field(req, "method"), "_agent_discovery"))
+            rpc_reply(field(req, "id"), collaboration_discovered(field(req, "params")), 0, NULL);
+        else if (jstr(field(field(req, "params"), "name"), "_agent_status"))
+            rpc_reply(field(req, "id"), call_tool("_agent_status", field(field(req, "params"), "arguments")), 0, NULL);
+        else mcp_dispatch(line);
+        cJSON_Delete(req); fclose(output); mcp_output = NULL; mcp_phase = phase; mcp_output_failed = failed;
+    }
+    free(line);
+    pthread_mutex_lock(&collaboration_mutex);
+    collaboration_reply = reply; collaboration_done = 1;
+    pthread_cond_signal(&collaboration_cond); pthread_mutex_unlock(&collaboration_mutex);
+}
+/* An attached client (the bridge names it in params.client) that calls a board tool while Collaborate is
+   off waits for the human: the request stays unanswered until Deny, Allow once, Allow for this session,
+   or PERMIT_WAIT seconds. The listener serves one request at a time, so others queue behind it. */
+#define PERMIT_WAIT 45
+static char *permit_line, permit_text[160];
+static int asks_permission(const char *line) {
+    cJSON *req = cJSON_Parse(line); const cJSON *params = field(req, "params"), *client = field(params, "client"), *name = field(params, "name");
+    int ask = !collaborating && jstr(field(req, "method"), "tools/call") && cJSON_IsString(client) && cJSON_IsString(name)
+              && !jstr(name, "get_status") && !jstr(name, "measure_text"), known = 0;
+    for (const cJSON *t = ask ? field(mcp_spec, "tools")->child : NULL; t; t = t->next) known |= jstr(name, field(t, "name")->valuestring);
+    if (ask && known) snprintf(permit_text, sizeof permit_text, "%.60s wants to call %.40s", client->valuestring, name->valuestring);
+    cJSON_Delete(req); return ask && known;
+}
+static void permit_answer(int answer) { /* 0 deny, 1 allow once, 2 allow for this session */
+    char *line = permit_line;
+    if (!line) return;
+    permit_line = NULL; permit_shown = 0; permit_until = 0;
+    if (answer == 2) { /* the toggle's On state, but without starting automatic replies */
+        collaboration_epoch++; collaborating = 1; automatic_requested = 0; strcpy(collaboration_status, "Chat tools connected");
+    }
+    permit_once = answer == 1;
+    collaboration_answer(line, answer ? NULL : "The human declined access in the Paintboard window.");
+    permit_once = 0;
+}
+static void permit_ui(void) {
+    float x, y, w; dialog_box(170, &x, &y, &w); char title[200], body[300];
+    if (!ui_mode) {
+        snprintf(title, sizeof title, "%s", permit_text); fit(title, 20, w - 40);
+        text_draw(&ui_font, x + 20, y + 16, 20, INK, title);
+        snprintf(body, sizeof body, "It acts on %s, and Collaborate is off. Allow for this session\nturns Collaborate on, without automatic replies.", base_name(path));
+        text_draw(&ui_font, x + 20, y + 56, 13, MUTED, body);
+    }
+    if (button(x + 20, y + 118, 90, 32, "Deny", NULL, 0)) { permit_answer(0); return; }
+    if (button(x + w - 292, y + 118, 110, 32, "Allow once", NULL, 1)) { permit_answer(1); return; }
+    if (button(x + w - 174, y + 118, 154, 32, "Allow for this session", NULL, 0)) permit_answer(2);
+}
 static void collaboration_pump(void) {
     if (!collaboration_started) return;
     int scan_status;
@@ -204,25 +258,18 @@ static void collaboration_pump(void) {
     if (collaboration_worker && waitpid(collaboration_worker, NULL, WNOHANG) == collaboration_worker) {
         collaboration_worker = 0; strcpy(collaboration_status, "Agent stopped; toggle to retry");
     }
-    pthread_mutex_lock(&collaboration_mutex);
-    char *line = collaboration_request; collaboration_request = NULL;
-    pthread_mutex_unlock(&collaboration_mutex);
-    if (!line) return;
-    char *reply = NULL; size_t len; FILE *output = open_memstream(&reply, &len);
-    if (output) {
-        int phase = mcp_phase, failed = mcp_output_failed; mcp_phase = 2; mcp_output = output;
-        cJSON *req = cJSON_Parse(line);
-        if (jstr(field(req, "method"), "_agent_discovery"))
-            rpc_reply(field(req, "id"), collaboration_discovered(field(req, "params")), 0, NULL);
-        else if (jstr(field(field(req, "params"), "name"), "_agent_status"))
-            rpc_reply(field(req, "id"), call_tool("_agent_status", field(field(req, "params"), "arguments")), 0, NULL);
-        else mcp_dispatch(line);
-        cJSON_Delete(req); fclose(output); mcp_output = NULL; mcp_phase = phase; mcp_output_failed = failed;
+    if (permit_line && (collaborating || glfwGetTime() >= permit_until)) { /* turned on meanwhile, or nobody answered */
+        char *line = permit_line; permit_line = NULL; permit_shown = 0; permit_until = 0;
+        collaboration_answer(line, collaborating ? NULL : "Nobody answered in the Paintboard window. Ask the human to allow access, then retry.");
     }
-    free(line);
     pthread_mutex_lock(&collaboration_mutex);
-    collaboration_reply = reply; collaboration_done = 1;
-    pthread_cond_signal(&collaboration_cond); pthread_mutex_unlock(&collaboration_mutex);
+    char *line = permit_line ? NULL : collaboration_request; /* a held request blocks the listener anyway */
+    if (line) collaboration_request = NULL;
+    pthread_mutex_unlock(&collaboration_mutex);
+    if (line && asks_permission(line)) { permit_line = line; permit_until = glfwGetTime() + PERMIT_WAIT; line = NULL; }
+    if (permit_line && !custom_dialog && !fd_mode && !asking && !disk_asking && !pending && editing < 0 && drag == NONE && !panning)
+        permit_shown = 1; /* not in the middle of the human's stroke or typing */
+    if (line) collaboration_answer(line, NULL);
 }
 static void collaboration_stop(void) {
     collaboration_cancel();
@@ -230,6 +277,6 @@ static void collaboration_stop(void) {
     if (!collaboration_started) return;
     pthread_cancel(collaboration_thread); pthread_join(collaboration_thread, NULL);
     close(collaboration_fd); unlink(collaboration_socket);
-    free(collaboration_request); free(collaboration_reply);
+    free(collaboration_request); free(collaboration_reply); free(permit_line);
     if (!mcp_mode) cJSON_Delete(mcp_spec);
 }

@@ -123,6 +123,32 @@ pathlib.Path(args[args.index('--output-last-message') + 1]).write_text(json.dump
         self.assertEqual(len(replies), 2)
         self.assertIn("get_canvas", {t["name"] for t in replies[1]["result"]["tools"]})
 
+    def test_bridge_runs_several_calls_on_a_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            board, items = Path(directory) / "board.pb", Path(directory) / "items.json"
+            items.write_text(json.dumps({"items": [{"type": "rect", "id": "a", "x0": 0, "y0": 0, "x1": 100, "y1": 60, "label": "A"}]}))
+            env = {**os.environ, "PATH": str(Path(BINARY).parent) + os.pathsep + os.environ.get("PATH", "")}
+            run = lambda *args: subprocess.run([sys.executable, str(BRIDGE), "--file", str(board), *args],
+                                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, env=env)
+            result = run("--call", "add_items", "--args", f"@{items}",
+                         "--call", "update_items", "--args", '{"items": [{"id": "a", "item": {"type": "rect", "x0": 0, "y0": 0, "x1": 100, "y1": 60, "color": 1}}]}',
+                         "--call", "get_board")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            replies = [json.loads(line) for line in result.stdout.splitlines()]  # one line per call
+            self.assertEqual(len(replies), 3)
+            self.assertEqual((replies[2]["items"][0]["item"]["id"], replies[2]["items"][0]["item"]["color"]), ("a", 1))
+            self.assertEqual(board.read_bytes()[:4], b"PB05")  # the session saved on exit
+            saved = board.read_bytes()
+            failed = run("--call", "delete_items", "--args", '{"ids": ["a"]}', "--call", "delete_items", "--args", '{"ids": ["a"]}')
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("call 2 (delete_items)", failed.stderr)
+            self.assertEqual(board.read_bytes(), saved)  # a failed run leaves the file alone
+            single = run("--call", "get_board", "--args", "@-")
+            self.assertEqual(single.returncode, 1)  # empty stdin is not JSON
+            piped = subprocess.run([sys.executable, str(BRIDGE), "--file", str(board), "--call", "get_board", "--args", "@-"],
+                                   input='{"limit": 1}', capture_output=True, text=True, timeout=20, env=env)
+            self.assertEqual(json.loads(piped.stdout)["total"], 1)  # one call prints indented JSON
+
     def test_discovery_checks_path_common_locations_and_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

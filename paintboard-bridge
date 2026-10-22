@@ -72,12 +72,53 @@ def discover_agents(custom=None):
     return found
 
 
-def rpc(endpoint, method, params=None):
+class Headless:
+    """A paintboard --mcp --headless session on one board file. close() lets it save; abort() does not."""
+    def __init__(self, board):
+        binary = Path(__file__).resolve().parent / "paintboard"
+        command = str(binary) if binary.is_file() else shutil.which("paintboard")
+        if not command:
+            raise ToolError("paintboard executable not found")
+        self.process = subprocess.Popen([command, "--mcp", "--headless", str(board)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.serial = 0
+        self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                    "clientInfo": {"name": "paintboard-bridge", "version": "0.4.0"}})
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+
+    def request(self, method, params=None):
+        self.serial += 1
+        message = {"jsonrpc": "2.0", "id": self.serial, "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            self.process.stdin.write(json.dumps(message) + "\n")
+            self.process.stdin.flush()
+        except BrokenPipeError:
+            pass
+        line = self.process.stdout.readline()
+        if not line:
+            raise ToolError("paintboard exited; see its messages above")
+        return json.loads(line)
+
+    def close(self):
+        """End the session: paintboard saves every board with changes."""
+        self.process.stdin.close()
+        if self.process.wait():
+            raise ToolError("paintboard could not save the board; see its messages above")
+
+    def abort(self):
+        self.process.kill()
+        self.process.wait()
+
+
+def rpc(endpoint, method, params=None, timeout=5):
+    if isinstance(endpoint, Headless):
+        return endpoint.request(method, params)
     message = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         message["params"] = params
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(5)
+        connection.settimeout(timeout)
         connection.connect(str(endpoint))
         connection.sendall(json.dumps(message).encode() + b"\n")
         with connection.makefile("rb") as stream:
@@ -85,8 +126,15 @@ def rpc(endpoint, method, params=None):
     return reply
 
 
-def tool(endpoint, name, **args):
-    reply = rpc(endpoint, "tools/call", {"name": name, "arguments": args})
+# A window holds a call from a named client while it asks the human, for at most 45 seconds.
+PERMIT_TIMEOUT = 60
+
+
+def tool(endpoint, name, client=None, **args):
+    params = {"name": name, "arguments": args}
+    if client:
+        params["client"] = client
+    reply = rpc(endpoint, "tools/call", params, PERMIT_TIMEOUT if client else 5)
     if "error" in reply:
         raise ToolError(reply["error"]["message"])
     result = reply["result"]
@@ -135,13 +183,13 @@ def schema():
     spec = json.loads(shared("mcp-tools.json").read_text())
     tools = copy.deepcopy(spec["tools"])
     for definition in tools:
-        if definition["name"] in ("add_items", "update_items"):
+        if definition["name"] in ("add_items", "update_items", "replace_items"):
             definition["inputSchema"]["$defs"] = {"item": spec["itemSchema"]}
     return tools
 
 
 def serve_mcp(args):
-    phase = 0
+    phase, client = 0, "An MCP client"
     for line in sys.stdin:
         request_id = None
         try:
@@ -160,13 +208,17 @@ def serve_mcp(args):
                 if phase:
                     raise ToolError("Already initialized")
                 requested = request.get("params", {}).get("protocolVersion")
+                name = (request.get("params", {}).get("clientInfo") or {}).get("name")
+                client = name if isinstance(name, str) and name else client
                 version = requested if requested in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2025-11-25"
                 result = {"protocolVersion": version, "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                           "serverInfo": {"name": "paintboard-live", "version": "0.1.0"},
-                          "instructions": "Attach to the user's existing Paintboard. Collaborate must be enabled in its UI. "
+                          "instructions": "Attach to the user's existing Paintboard. While Collaborate is off, the window asks the human "
+                                          "to allow each call, and the call waits up to 45 seconds for the answer. "
                                           f"The {GUIDE_URI} resource and the paintboard_guide prompt explain coordinates, styles, and layout with an example. "
                                           "Read get_board and get_canvas before responding; pass their revision and collaboration_epoch to add_items. "
-                                          "In add_items, give shapes an id and a label, and connect them with arrows using from/to. "
+                                          "Use add_graph for boxes and arrows; it does the layout. In add_items, give items an id and a label, and connect them with arrows using from/to. "
+                                          "update_items and delete_items take ids without a revision. "
                                           "Tools act on the window's active tab; list_tabs and switch_tab change it. "
                                           "Respond with editable words and symbols; preserve the user's drawing."}
                 phase = 1
@@ -186,8 +238,8 @@ def serve_mcp(args):
                 text = shared("agent-guide.md").read_text()
                 result = {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
             elif method == "tools/call":
-                try:
-                    reply = rpc(resolve(args), method, request.get("params"))
+                try:  # the client's name lets the window ask the human when Collaborate is off
+                    reply = rpc(resolve(args), method, {**(request.get("params") or {}), "client": client}, PERMIT_TIMEOUT)
                     reply["id"] = request_id
                     print(json.dumps(reply), flush=True)
                     continue
@@ -555,17 +607,62 @@ def watch(endpoint, agent="codex", executable=None, custom=None):
         time.sleep(0.25)
 
 
+class AddCall(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        namespace.call = [*(namespace.call or []), [value, "{}"]]
+
+
+class AddArgs(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        if not namespace.call:
+            parser.error("--args belongs to the --call before it")
+        namespace.call[-1][1] = value
+
+
+def call_arguments(text):
+    """JSON tool arguments, or @FILE to read them from a file, or @- from stdin."""
+    if text.startswith("@"):
+        text = sys.stdin.read() if text == "@-" else Path(text[1:]).read_text()
+    arguments = json.loads(text)
+    if not isinstance(arguments, dict):
+        raise ToolError("Tool arguments must be a JSON object")
+    return arguments
+
+
+def run_calls(args):
+    endpoint = Headless(args.file) if args.file else resolve(args)
+    try:
+        for number, (name, text) in enumerate(args.call, 1):
+            try:
+                result = tool(endpoint, name, client="paintboard-bridge", **call_arguments(text))
+            except (OSError, ValueError, ToolError) as error:
+                raise ToolError(f"call {number} ({name}): {error}") from error
+            output = result.get("structuredContent", result)
+            image = next((part for part in result.get("content", []) if part.get("type") == "image"), None)
+            if args.image_out and image:
+                Path(args.image_out).write_bytes(base64.b64decode(image["data"], validate=True))
+                output["image_path"] = str(Path(args.image_out).resolve())
+            print(json.dumps(output, indent=2) if len(args.call) == 1 else json.dumps(output), flush=True)
+    except BaseException:
+        if isinstance(endpoint, Headless):
+            endpoint.abort()  # a failed run leaves the file as it was
+        raise
+    if isinstance(endpoint, Headless):
+        endpoint.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket")
     parser.add_argument("--board", help="Attach to the open window for this file")
+    parser.add_argument("--file", help="Run the calls on this board file in a headless paintboard, which saves the board when they all succeed")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--list", action="store_true")
     action.add_argument("--mcp", action="store_true")
     action.add_argument("--watch", action="store_true")
     action.add_argument("--discover", action="store_true")
-    action.add_argument("--call", metavar="TOOL")
-    parser.add_argument("--args", default="{}", help="Tool arguments as JSON")
+    action.add_argument("--call", metavar="TOOL", action=AddCall, help="Call a tool; repeat for several calls in one run")
+    parser.add_argument("--args", action=AddArgs, help="Arguments of the --call before it: JSON, @FILE, or @- for stdin")
     parser.add_argument("--image-out", help="Write a returned image to this path")
     parser.add_argument("--agent", choices=AGENTS, default="codex")
     parser.add_argument("--executable", help="Selected agent executable")
@@ -573,6 +670,8 @@ def main():
     parser.add_argument("--custom-command")
     parser.add_argument("--custom-transport", choices=CUSTOM_TRANSPORTS, default="acp")
     args = parser.parse_args()
+    if args.file and not args.call:
+        parser.error("--file needs --call")
     if args.discover:
         agents = discover_agents()
         error = ""
@@ -597,13 +696,7 @@ def main():
         custom = {"command": args.custom_command, "transport": args.custom_transport} if args.custom_command is not None else None
         watch(resolve(args), args.agent, args.executable, custom)
     else:
-        result = tool(resolve(args), args.call, **json.loads(args.args))
-        output = result.get("structuredContent", result)
-        if args.image_out:
-            image = next(part for part in result["content"] if part["type"] == "image")
-            Path(args.image_out).write_bytes(base64.b64decode(image["data"], validate=True))
-            output["image_path"] = str(Path(args.image_out).resolve())
-        print(json.dumps(output, indent=2))
+        run_calls(args)
 
 
 if __name__ == "__main__":

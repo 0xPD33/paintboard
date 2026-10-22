@@ -3,7 +3,8 @@
 The board and GUI live in `paintboard.c`; `mcp.c` is included into the same
 translation unit and exposes those operations to agents. `collaboration.c`
 connects existing windows to clients; `paintboard-bridge` runs the local MCP
-proxy and the automatic agent watcher. Tool schemas are
+proxy and the automatic agent watcher, and runs tool calls from scripts on a
+window or, through a headless `paintboard`, on a board file. Tool schemas are
 embedded from `mcp-tools.json`. The build uses a Makefile. This document
 explains the parts that are not obvious from reading the source top to bottom.
 
@@ -23,7 +24,10 @@ frame, and the code stays short.
 Everything on the board is an `Item`:
 
 ```c
-typedef struct { int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np, from, to; } Item;
+typedef struct {
+    int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np, from, to;
+    int id, label, caption, parent, style, cols; float label_size, wrap, ox, oy;
+} Item;
 ```
 
 One flat array, `items`, holds them in paint order. Index 0 draws first and sits
@@ -32,10 +36,24 @@ at the back. `sel` marks the item as selected.
 `x0, y0, x1, y1` mean different things per type. For a rectangle or an ellipse
 they are two opposite corners. For a line or an arrow they are the two ends. For
 text and for a pen stroke, `x0, y0` is the anchor and `x1, y1` is the measured
-bottom right corner, which the code recomputes rather than stores as truth.
+bottom right corner, which the code recomputes rather than stores as truth. A
+table stores its top left corner and its right edge; `measure()` sets `y1` from
+the wrapped cell text.
 
 `width` is the stroke width in world units. For text it also sets the size, at
 seven pixels per unit.
+
+The other fields:
+
+- `id`, `label`, and `caption` hold a `tpool` offset plus one, and 0 means none.
+  An id is unique on the board. A copy, a paste, and a duplicate drop it.
+- `parent` holds the index plus one of the item's container, like `from` and `to`.
+- `style` holds the `DASHED` and `ELBOW` bits.
+- `cols` is a table's column count. `np` counts its cells.
+- `label_size` is the label text size, and 0 means 3, so a zeroed `Item` needs
+  no extra setup. A caption is three quarters of it.
+- `wrap` is a text item's line width. 0 does not wrap.
+- `ox, oy` move a connector's waypoints; see [Routes](#routes).
 
 ### Linked ends
 
@@ -43,33 +61,71 @@ seven pixels per unit.
 the item's index plus one, so 0 is a free end and a zeroed `Item` has no links.
 Only lines and arrows have links.
 
-A linked end is derived data. `relink()` puts it on the linked item's bounding
-box, 8 units outside, on the line toward the other end. That other end is the
-center of its linked item, or the free end's point. Every change to an item's
+A linked end is derived data. `relink()` puts it 8 units outside the linked
+item's outline, on the line from the item's center toward the end's neighbor.
+The neighbor is the nearest waypoint, else the other end: the center of its
+linked item, or the free end's point. `outline_t()` intersects that line with the
+item's `poly()` outline, so an end meets a diamond, an ellipse, or a star at its
+edge. It takes the last crossing, so the end sits outside a star's points. Text,
+tables, and pen strokes use their box. An `ELBOW` end leaves from the middle of
+the side that faces its neighbor. Every change to an item's
 box calls `relink()`: a move, a resize, a text edit, a width change, an MCP add
-or update, and a load. Overlapping boxes connect center to center.
+or update, and a load. When two linked ends would cross, the line connects
+center to center.
 
 Indices shift when items are removed, so every removal goes through
-`compact()`. It moves the links to the new indices. An end whose item is removed
-becomes free where it is. A move or resize that takes a connector but not its
+`compact()`. It moves the links and the parents to the new indices. An end whose
+item is removed becomes free where it is, and an item whose container is removed
+leaves it. A move or resize that takes a connector but not its
 linked item frees that end: the connector goes where the human drags it. Copy,
-cut, paste, and duplicate keep the links between the copied items and drop the
-others. Undo needs nothing extra, because a snapshot holds the links.
+cut, paste, and duplicate keep the links and parents between the copied items
+and drop the others. Undo needs nothing extra, because a snapshot holds them.
 
 The human links an end in three ways. A line or arrow that starts on an item
 links its start. One that ends on an item links its end. Dragging the end handle
 of one selected connector onto an item links the end nearer the pointer.
 `link_target()` finds the topmost item under the point that is not a connector.
 
+### Routes
+
+A line or an arrow can have waypoints, `np` points in `pool` from `p0`. A
+waypoint is `(ox + x * sx, oy + y * sy)`. The ends move on their own when they
+are linked, so the waypoints cannot hang off `x0, y0` as pen points do. A move
+adds to `ox, oy`, and a resize scales `ox, oy` and `sx, sy` about the anchor,
+so the pool is never rewritten. A connector with waypoints whose two linked
+ends move together moves its waypoints too.
+
+`conn_route()` builds the drawn polyline into a scratch buffer: the start, the
+waypoints, and the end. With `ELBOW` it turns each step into right angles: an L
+between two points, and a Z into a linked end that the route meets head on. It
+is derived on every draw, hit test, bounding box, and export, so it needs no
+storage and is never stale. A label sits halfway along the route, on a white
+backdrop, and counts in the connector's bounding box and hit test.
+
+### Containers
+
+An item with `parent` sits in a container. A container is any item that holds
+another one. A move takes every item whose chain of parents reaches a selected
+item, and `update_items` moves the items of a container it moves by the same
+offset. A drag that ends with an item fully inside a container puts it in, and
+one that ends outside its container takes it out. `frame_selection()` (`Ctrl+G`)
+inserts a dashed rectangle just below the lowest selected item, so it paints and
+hit-tests behind them, and `insert_item()` moves the later links and parents up
+by one. The selected items whose container is not selected move into it. A chain of containers is at
+most 64 deep. `load()` and MCP edits refuse a deeper chain or a loop, and the
+check is the same `depth()` walk.
+
 ### The two pools
 
-Pen points and text bytes do not live in the `Item`. They live in two pools:
+Pen points, waypoints, and text bytes do not live in the `Item`. They live in two pools:
 
 - `pool`, an array of floats, holds pen points as `x, y` pairs relative to the
-  item anchor.
-- `tpool`, an array of bytes, holds UTF-8 text with a NUL after each string.
+  item anchor, and waypoints.
+- `tpool`, an array of bytes, holds UTF-8 text with a NUL after each string:
+  text items, table cells one after another, ids, labels, and captions.
 
-An item points into a pool with `p0` and counts elements with `np`.
+An item points into a pool with `p0` and counts elements with `np`. An id, a
+label, and a caption point into `tpool` on their own.
 
 Both pools are append only. Nothing is ever removed from them, and no existing
 entry is ever rewritten. That single rule is what makes undo cheap, so it is
@@ -87,7 +143,10 @@ caret. When a pen or marker stroke ends, `smooth_stroke` averages the stroke's
 points in place at the tail of `pool`. No snapshot refers to those entries yet.
 When you click an existing text item to edit it, `start_edit` copies its bytes to
 the end of the pool and repoints the item there, so the older snapshots keep
-looking at the original copy.
+looking at the original copy. A label edit works the same way:
+`start_label_edit` copies the label to the tail and repoints `label`, and
+`edit_s()` and `edit_n()` give the typing code the string and its length.
+Erasing a whole label removes the label, not the item.
 
 Saving or exporting while typing commits that copy and starts a new edit copy,
 so continued typing cannot rewrite the saved/undo version. Finishing an empty
@@ -149,14 +208,15 @@ share a revision number. A switch does not change `collaboration_epoch` or
 only because the user opened it. It replies after the next human edit.
 
 Some state belongs to the window, not to a board. The tool, the stroke and fill
-colors, the tool widths, grid snap, the panel scroll, the agent selection, and
+colors, the tool widths, grid snap, the Dash and Elbow toggles, the panel scroll, the agent selection, and
 the clipboard stay global for all tabs.
 
 The clipboard must work across tabs. Each pool belongs to one board, so a copied
 item cannot keep its pool index. A copy therefore stores the items and a private
-copy of their pen points and text bytes. A paste appends that data to the active
-pools and moves each `p0` to the new location. `bbox()` cannot read the private
-copy, so a copy also records the top left corner of the selection for the paste.
+copy of their points, text bytes, table cells, labels, and captions. A paste
+appends that data to the active pools and moves each offset to the new location.
+`bbox()` cannot read the private copy, so a copy also records the top left corner
+of the selection for the paste.
 
 Each `Doc` has a `dirty` flag. `changed()` and `restore()` set it, and a
 successful save clears it. An undo back to the saved state leaves the flag set.
@@ -165,6 +225,31 @@ That costs a needless save, which is harmless.
 A tab with no `path` is "Untitled". Save on an Untitled tab opens Save As.
 Export PNG and Export SVG on an Untitled tab show "Save the board first",
 because the export path comes from the board path.
+
+### Changes on disk
+
+Another process, such as a headless MCP session, can save a file that a tab has
+open. Each `Doc` keeps a `Stamp` of its file as it last read or wrote it: the
+modification time in nanoseconds, the size, the inode, and the device. Saves
+replace the file by rename, so every save gets a new inode, and two saves in
+the same nanosecond still differ.
+
+- `save()` refuses with -3 when the file on disk no longer matches the stamp,
+  unless the caller forces it. Save As clears the stamp, because it belonged to
+  the old file.
+- The window checks the active tab when it gets the focus and after a tab
+  switch. A tab with no unsaved changes reloads at once. A tab with changes, and
+  a refused save, show **Keep mine**, **Overwrite**, and **Reload**. Keep mine
+  takes the new stamp, so the next save replaces the file.
+- `reload()` is `load(1)`: it appends the file to the pools and replaces the
+  items as one undo step, so Undo brings back the version before it.
+- `save_board` returns a tool error instead of the question, `overwrite: true`
+  forces it, and `open_board` with `reload: true` reloads.
+- On stdin EOF an MCP session saves only the tabs with changes, and refuses a
+  file that changed. It reports that on stderr and exits with status 1.
+
+ponytail: there is no file watcher, so a tab that keeps the focus does not see
+a change until a tab switch or a save. Add inotify if live reload matters.
 
 ### Closing
 
@@ -293,7 +378,7 @@ tabs. `list_tabs`, `switch_tab`, `new_board`, `open_board`, and `close_tab` give
 an agent the same tab operations as the human. `save_board` with a `path` is Save
 As, and an Untitled tab needs one. `export_png` and `export_svg` on an Untitled
 tab return a tool error. A tab switch changes the revision, so an agent sees a stale revision error
-and must read the board again. A file dialog, a close question, or a pending
+and must read the board again. A file dialog, a close question, the changed-file question, or a pending
 close makes the window busy: the watcher waits, and board tools return a busy
 error.
 
@@ -302,7 +387,8 @@ has no dialog, so the refusal takes the place of the question.
 
 `--mcp` takes at most one FILE and loads it before the window opens. A bad file
 stops startup, because the client needs that board. On stdin EOF the program
-saves every named tab without a question. `--mcp --headless` has tabs too, through
+saves every named tab with changes without a question, as [Changes on disk](#changes-on-disk)
+describes. `--mcp --headless` has tabs too, through
 the same tools.
 
 ## Coordinates
@@ -339,6 +425,10 @@ The marker draws its stroke at 35% opacity. The joins overlap, so a plain blend
 would darken them. The marker therefore uses the stencil buffer, so each pixel
 gets paint only once per stroke.
 
+A `DASHED` item strokes with `dashes()`: pieces as long as twice the width, at
+least 6 units, with round caps and gaps of that length plus the width. The
+phase runs on across joins, so a dash turns a corner whole.
+
 ## Text
 
 Both fonts are baked once at startup with `stbtt_BakeFontBitmap` into a 1024 by
@@ -354,7 +444,19 @@ clear it only measures, which is how `measure()` keeps `x1, y1` on a text item
 correct. Code points outside the baked range render as a question mark.
 
 Font metrics can change between builds, so `load()` re-measures every text item
-instead of trusting the stored box.
+instead of trusting the stored box, and sizes every table again.
+
+`wrap_copy()` wraps text at a width. It copies the string and turns into a
+newline the space before each word that would pass the width. The byte offsets
+do not change, so the caret code works on the copy. A word wider than the width
+runs over. `text_lines()` lays out the lines, left-aligned or centered, and draws
+them with OpenGL or writes them as SVG, so the canvas and the export match.
+
+`label_layout()` places a shape's label and caption. It centers them and wraps
+them to the share of the box that holds text: all of a rectangle, 72% of an
+ellipse, half of a diamond or a triangle, and 40% of a star. A container shows
+them left-aligned at its top instead, so its items have room. `mark_containers()`
+finds the containers once per frame.
 
 The fonts are compiled into the binary with the C23 `#embed` directive. This is
 the reason for the GCC 15 requirement. It removes any question of where the font
@@ -365,8 +467,9 @@ files are at runtime.
 `hit()` walks the array backwards, so the item on top wins. The test depends on
 the type:
 
-- Pen, line, and arrow use point to segment distance against every segment.
-- Closed shapes and text use the bounding box.
+- Pen strokes use point to segment distance against every segment. Lines and
+  arrows do the same along their route, and also take a click on their label.
+- Closed shapes, text, and tables use the bounding box.
 
 The eraser calls the same test with `edges` set. Then an unfilled shape counts
 only its outline, so you can erase the items inside a frame and keep the frame.
@@ -412,12 +515,18 @@ The draw pass translates by `-panel_scroll` and the hit test pass adds
 `panel_scroll` to the click, so the two passes stay aligned. `ui()` records its
 final `y` as the panel height, so a new widget needs no extra bookkeeping.
 
+A control is live only when it changes something now: the next item of the
+current tool, the text being edited, or the selection. `live()` asks that of each
+type a control applies to, and `ui_off` greys out the next widgets and makes the
+hit test pass skip them. So the pen greys out the fill, Snap, Dash, and Elbow,
+and the eraser also greys out the colors and the width.
+
 ## File format
 
 A board file is a header and three arrays:
 
 ```
-"PB04"            4 bytes
+"PB05"            4 bytes
 nitems            int32
 npool             int32
 ntpool            int32
@@ -430,12 +539,20 @@ The item structs are written as they sit in memory. This is not portable across
 compilers or architectures, and that is an accepted trade for a personal format.
 It also means the format version must change whenever `Item` changes.
 
-`load()` validates before it commits. It checks the counts against sane limits,
-then checks every item: the type and the color are in range, the numbers are
-finite, and the pool slice fits inside the pool. A text item must also end at a
-NUL. A link must name another item in the file, and only a line or an arrow can
-have one. A file that fails any check is rejected whole, and the open fails with a
-message rather than opening a half read board.
+`load()` reads the whole file into private arrays and validates before it
+commits, so a bad file changes nothing. It checks the counts against sane limits,
+then checks every item with `item_ok()`: the type and the color are in range,
+the numbers are finite, and the pool slice fits inside the pool. A text item
+must end at a NUL, and a table's cells must all end inside `tpool`. An id, a
+label, or a caption must be a string inside `tpool`, and only the types that
+show them can have them. A link must name another item in the file, and only a
+line or an arrow can have one. A parent must name another item, and no chain of
+parents may pass 64 or loop. A file that fails any check is rejected whole, and
+the open fails with a message rather than opening a half read board.
+
+`load(1)` is a reload. It appends the file's pools to the open ones, moves the
+offsets to match, and replaces the items after one `checkpoint()`. The older
+snapshots keep their pool entries, so the reload is one undo step.
 
 Only a missing file starts an empty board. Other open errors fail that open, as
 described in [Opening](#opening).
@@ -445,9 +562,10 @@ after success. Existing file permissions are retained. A failed save reports an
 error and leaves the previous file intact.
 
 Older files still load. `PB02` had no fill, no selection flag, and no pen scale.
-`PB03` had no links. The reader converts each through a small struct that
-matches the old layout and fills the new fields with defaults. They are written
-back as `PB04`.
+`PB03` had no links. `PB04` had no ids, labels, captions, parents, styles,
+tables, wraps, or waypoints. The reader converts each through a small struct
+that matches the old layout. `PB03` and `PB04` are prefixes of `Item`, so the
+new fields start at zero, which is their default. They are written back as `PB05`.
 
 ## PNG export
 
@@ -486,8 +604,11 @@ driver. The panel button and `Ctrl+Shift+E` write it next to the board file.
 
 Each item maps to the shape the canvas draws. Strokes use round caps and joins.
 The marker is one element at 35% opacity, so its overlaps do not darken, as with
-the stencil. Arrow heads use the same geometry as `draw_item`. Text is one
-`<text>` element per line, so blank lines keep their height.
+the stencil. A line or an arrow is a polyline along its route, and arrow heads
+use the same geometry as `draw_item`. A dashed stroke uses `stroke-dasharray`
+with the dash and gap lengths of the canvas. Text, labels, captions, and table
+cells come from the same `text_lines()` layout as the canvas, one `<text>`
+element per line at its own baseline. A centered line uses `text-anchor`.
 
 A board with text embeds Excalifont as a base64 `@font-face`, about 80 KB, so
 the text keeps its look and width in a browser. The font size is the canvas
@@ -511,13 +632,50 @@ Requests arriving during a human drag or text edit return a busy error. On stdin
 EOF the app saves and exits; when the window closes, the reader thread is stopped
 before GLFW is terminated. The stdio mode does not listen on a TCP port.
 
-Items keep the file layout. Agents address them by array index paired with a
-monotonic session revision, which changes on checkpoints and history restores.
-This prevents stale edits after human actions, deletions, or undo. Add/update
-batches stage all items first and create one checkpoint only after validation;
-failed batches roll back unused pool tails. Agent edits share normal GUI undo.
+Items keep the file layout. Agents address them by id, or by array index paired
+with a monotonic session revision, which changes on checkpoints and history
+restores. An index can point at another item after human actions, deletions, or
+undo, so an edit that uses one needs the current revision. An id cannot, so an
+edit that names items only by id needs none, and a script can edit without
+reading the board first. `find_id()` scans the items.
+ponytail: a linear scan per name; index the ids if boards reach ~100k items.
+
+`edit_items()` serves `add_items`, `update_items`, and `replace_items`. It
+stages and checks the whole batch, including unique ids and the nesting after
+the commit, and then creates one checkpoint. Failed batches roll back unused
+pool tails. An update entry is `{id, item}`, `{index, item}`, or a complete item that
+carries its id, which is the form agents send most often. An update keeps an
+item's id unless the new definition names one.
+`replace_items` empties the board inside the same undo step, so its references
+can only name earlier items of the batch. Agent edits share normal GUI undo.
 Reads paginate through the item array, and exports return a PNG path plus an
 inline image preview when the file is at most 32 MiB.
+
+### Graph layout
+
+`add_graph` turns nodes and edges into items and sends them through
+`edit_items()`, so it validates, links, and undoes like `add_items`. It runs
+four steps:
+
+1. Size every box so that its label fits the share of the shape that holds
+   text, with sides on the 20 unit grid.
+2. Rank the nodes. An iterative depth-first search marks each edge that closes
+   a cycle. The longest path over the other edges ranks the rest, and `rank`
+   pins a rank. Empty ranks close up.
+3. Order each rank. Nine sweeps sort it by the mean position of the neighbors in
+   the ranks before it, then after it. A group sorts by the mean of its nodes,
+   so its nodes stay together.
+4. Place the nodes along the cross axis. Sweeps rank by rank, down and up and
+   ending down, move each node toward the mean of its neighbors in the previous
+   rank. A forward pass and a backward pass keep the order and the spacing, and
+   the node takes their mean. A node with one parent therefore ends in line with
+   it, so a chain is straight. Centers snap to the grid.
+
+A group becomes a dashed container around its nodes, with the group name as its
+id. An edge that closes a cycle gets two waypoints past the graph and elbows,
+far enough out that its label clears the graph and the loops before it.
+ponytail: an edge that skips a rank is a straight line and can cross a box in
+between; route it through a waypoint per rank if that becomes common.
 
 `--mcp --headless` runs the same dispatcher synchronously without GLFW startup.
 It bakes fonts for text measurement. Its images come from offscreen rendering.
@@ -527,17 +685,17 @@ It bakes fonts for text measurement. Its images come from offscreen rendering.
 The server makes diagrams cheap to describe, so an agent does not need to do
 coordinate math:
 
-- In `add_items`, an item can take an `id`. A line or an arrow can take `from`,
-  `to`, or both instead of the coordinates of that end: a board index, or the
-  `id` of an earlier item in the same batch. The ends become
-  [linked ends](#linked-ends), so they follow their items when an agent or the
-  human moves them. `update_items` takes `from` and `to` as board indices, and
-  `get_board` reports them, so a connector read and sent back stays linked.
-  Coordinates sent for a linked end are recomputed.
-- A closed shape can take a `label`. `add_label` adds a black text item centered
-  on the shape, right after it. Black is readable on every fill, because every
-  fill color is light. The label is an ordinary item, so the format does not
-  change, and the human can edit it.
+- An item can take an `id`. A line or an arrow can take `from`, `to`, or both
+  instead of the coordinates of that end, and any item can take a `parent`:
+  a board index, an id on the board, or the `id` of an earlier item in the same
+  batch. The ends become [linked ends](#linked-ends), so they follow their items
+  when an agent or the human moves them. `get_board` reports every field that
+  `parse_item` takes, with links and parents as board indices, so an item read
+  and sent back keeps its links. Coordinates sent for a linked end are recomputed.
+- A shape, a line, or an arrow can take a `label`, and a shape a `caption`.
+  They are fields of the item, so they move with it, and the human edits them
+  with a double-click. A shape's label is black, which is readable on every
+  fill, because every fill color is light.
 - `add_items` returns the `bounds` of each item it was sent.
 - `measure_text` measures text with the canvas font before the agent places it.
   It reads no board, so it works while collaboration is off.
@@ -563,7 +721,17 @@ several clients can use the same window without sharing initialization state.
 Disconnecting a client does not end the drawing session.
 
 The UI toggle gates board reads and mutations at the C tool dispatcher. Only
-status/discovery is available while off. Turning on launches a Python watcher for the selected agent;
+status/discovery is available while off, with one exception. The MCP proxy and
+`--call` name their client in `params.client`. While the toggle is off, such a
+call to a board tool waits in `permit_line` and the window asks the human, once
+the human is not drawing or typing. The socket reader serves one request at a
+time, so the next requests wait behind it. **Allow once** answers the call with
+`permit_once` set. **Allow for this session** sets the toggle's On state without
+starting the watcher. **Deny**, or no answer within 45 seconds, answers with a
+tool error. The proxy waits 60 seconds for the reply. The watcher sends no
+client name, so a call that it makes after the toggle goes off fails at once.
+
+Turning on launches a Python watcher for the selected agent;
 turning off increments a collaboration epoch and terminates the watcher process
 group, including a running CLI child. Changing agents also advances the epoch and
 cancels pending work; Chat only retains manual tool access without a watcher.
@@ -623,9 +791,13 @@ The source marks its shortcuts with `ponytail:` comments. The ones that matter:
   there is no selection inside a text item.
 - PNG export from a window is limited to the visible area. `--render` draws the
   whole board.
-- A linked end stops at the item's bounding box, not at its outline. On an
-  ellipse, a diamond, or a star, an end that meets the box near a corner leaves
-  a gap to the outline.
+- Text wraps only at spaces. A word wider than the wrap width runs over.
+- The panel has no tools for tables or waypoints, and a table's cells are not
+  editable on the canvas. Agents set them through MCP.
+- Only an item that already holds another one takes a dropped item. `Ctrl+G`
+  starts a container around the selection.
+- The graph layout is a heuristic: see [Graph layout](#graph-layout).
+- Changes on disk show only on focus, a tab switch, or a save.
 
 - The UI scale reads the primary monitor's DPI once at startup. A window moved
   to a monitor with a different DPI keeps that scale; `PAINTBOARD_UI_SCALE` is

@@ -35,8 +35,12 @@ static const unsigned char TTF_CANVAS[] = {
 };
 
 /* Item types are saved in board files: append new ones before SELECT, never reorder. */
-enum { PEN, LINE, ARROW, RECT, ELLIPSE, TEXT, DIAMOND, TRIANGLE, STAR, HIGHLIGHT, SELECT, ERASER, NTOOLS };
+enum { PEN, LINE, ARROW, RECT, ELLIPSE, TEXT, DIAMOND, TRIANGLE, STAR, HIGHLIGHT, TABLE, SELECT, ERASER, NTOOLS };
 enum { NONE, DRAW, MOVE, RESIZE, MARQUEE, ERASE };
+enum { DASHED = 1, ELBOW = 2 }; /* Item.style bits */
+#define MAX_ROWS 100
+#define MAX_COLS 20
+#define MAX_DEPTH 64 /* deepest container nesting */
 #define NCOLORS 8
 #define MAX_UNDO 256
 #define PANEL_W 168
@@ -46,16 +50,24 @@ enum { NONE, DRAW, MOVE, RESIZE, MARQUEE, ERASE };
 #define INK 0x1e1e1e
 #define MUTED 0x868e96
 
-static const char *TOOL_NAME[NTOOLS] = {"Pen", "Line", "Arrow", "Rect", "Ellipse", "Text", "Diamond", "Triangle", "Star", "Marker", "Select", "Eraser"};
-static const char *TOOL_KEY[NTOOLS] = {"P", "L", "A", "R", "O", "T", "D", "I", "S", "H", "V", "E"};
+static const char *TOOL_NAME[NTOOLS] = {"Pen", "Line", "Arrow", "Rect", "Ellipse", "Text", "Diamond", "Triangle", "Star", "Marker", "Table", "Select", "Eraser"};
+static const char *TOOL_KEY[NTOOLS] = {"P", "L", "A", "R", "O", "T", "D", "I", "S", "H", "", "V", "E"};
 static int is_pen(int t) { return t == PEN || t == HIGHLIGHT; }
 static int fillable(int t) { return t == RECT || t == ELLIPSE || t == DIAMOND || t == TRIANGLE || t == STAR; }
+static int connector(int t) { return t == LINE || t == ARROW; }
+static int labelled(int t) { return fillable(t) || connector(t); }
 static const unsigned STROKE[NCOLORS] = {0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c00, 0x9c36b5, 0x0c8599, 0x868e96};
 static const unsigned FILLC[NCOLORS] = {0xe9ecef, 0xffc9c9, 0xb2f2bb, 0xa5d8ff, 0xffec99, 0xeebefa, 0x99e9f2, 0xdee2e6};
 
-/* fill < 0 = none. sx/sy scale pen points. width doubles as text size (px = width * 7).
-   from/to link a line or arrow end to the item at that index + 1; 0 is a free end. */
-typedef struct { int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np, from, to; } Item;
+/* fill < 0 = none. width doubles as text size (px = width * 7). from/to link a line or arrow end,
+   and parent puts an item in a container: each holds an item index + 1, and 0 is none.
+   id, label, and caption hold a tpool offset + 1, and 0 is none. p0/np: pen points relative to
+   x0,y0 and scaled by sx,sy; connector waypoints at ox,oy plus the point scaled by sx,sy; text
+   bytes; table cells, cols per row. label_size 0 means 3. wrap > 0 wraps text at that width. */
+typedef struct {
+    int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np, from, to;
+    int id, label, caption, parent, style, cols; float label_size, wrap, ox, oy;
+} Item;
 typedef struct { Item *it; int n; } Snap;
 typedef struct { GLuint tex; stbtt_bakedchar cd[224]; float px, ascent, em; } Font; /* em: CSS font-size per baked px */
 
@@ -79,11 +91,19 @@ static Item *base; /* undo-top snapshot that a move/resize is re-derived from on
 static double lastx, lasty;
 static char *path; /* absolute, or NULL for an Untitled tab */
 static int dirty; /* the active board differs from its file */
+typedef struct { long long sec, nsec, size, ino, dev; } Stamp;
+static Stamp disk; /* the file as this tab last read or wrote it; zero when unknown */
+static int disk_check; /* compare the active tab with its file at the next idle frame */
+static void disk_open(void);
 static unsigned long revision, human_revision, collaboration_epoch;
 static int collaborating, agent_mutation;
 static char collaboration_status[64] = "Off";
 static void collaboration_toggle(void);
 static void collaboration_select(void), collaboration_discover(void);
+static int permit_shown; /* an agent waits for the human to allow a call; see collaboration.c */
+static double permit_until; /* when that call gives up waiting, or 0 */
+static int permit_once; /* the human allowed the call being answered */
+static void permit_ui(void), permit_answer(int answer);
 #define NAGENTS 4
 #define CUSTOM_AGENT 3
 static const char *agent_ids[NAGENTS] = {"codex", "claude", "opencode", "custom"};
@@ -195,6 +215,39 @@ static float text_run(const Font *f, float x, float y, float px, const char *s, 
 }
 static float text_w(const Font *f, float px, const char *s) { return text_run(f, 0, 0, px, s, 0, NULL); }
 static void text_draw(const Font *f, float x, float y, float px, unsigned col, const char *s) { hex(col); text_run(f, x, y, px, s, 1, NULL); }
+static const char *tstr(int off) { return tpool + off - 1; } /* id, label, caption: a tpool offset + 1 */
+static float lsize(const Item *it) { return it->label_size ? it->label_size : 3; }
+static char *wrapbuf; static int capwrap;
+/* A writable copy of s, valid until the next call. With w > 0, the space before a word that would pass
+   w becomes a newline. Byte offsets do not change, so a caret offset holds in the copy. */
+static char *wrap_copy(const char *s, float px, float w) {
+    int n = strlen(s);
+    wrapbuf = grow(wrapbuf, &capwrap, n + 1, 1); memcpy(wrapbuf, s, n + 1);
+    char *line = wrapbuf, *space = NULL;
+    for (char *p = wrapbuf; w > 0; p++) {
+        if (*p && *p != ' ' && *p != '\n') continue;
+        char c = *p; *p = 0; float lw = text_w(&canvas_font, px, line); *p = c;
+        if (lw > w && space) { *space = '\n'; line = space + 1; } /* ponytail: a word wider than w overflows */
+        if (!c) break;
+        if (c == '\n') { line = p + 1; space = NULL; } else space = p;
+    }
+    return wrapbuf;
+}
+static void svg_text(FILE *f, float x, float y, const char *s, int middle);
+/* Lines of s, left-aligned at x or centered on it, from top y. Draws with GL when draw is set, writes
+   <text> elements when svg is set, and returns the height. */
+static float text_lines(const char *s, float x, float y, float px, float wrap, int centered, int draw, FILE *svg) {
+    char *t = wrap_copy(s, px, wrap); float h = 0;
+    for (char *line = t; ; h += px * 1.25f) {
+        char *end = strchr(line, '\n');
+        if (end) *end = 0;
+        float lx = centered ? x - text_w(&canvas_font, px, line) / 2 : x;
+        if (draw) text_run(&canvas_font, lx, y + h, px, line, 1, NULL);
+        if (svg && *line) svg_text(svg, x, y + h + px * canvas_font.ascent, line, centered);
+        if (!end) return h + px * 1.25f;
+        line = end + 1;
+    }
+}
 
 /* ---- geometry ---- */
 static void pen_pt(const Item *it, int k, float *x, float *y) {
@@ -206,18 +259,78 @@ static float seg_dist(float px, float py, float ax, float ay, float bx, float by
     t = t < 0 ? 0 : t > 1 ? 1 : t;
     return hypotf(ax + t * dx - px, ay + t * dy - py);
 }
-static void bbox(const Item *it, float *b) {
+static void extend(float *b, float x, float y) { b[0] = fminf(b[0], x); b[1] = fminf(b[1], y); b[2] = fmaxf(b[2], x); b[3] = fmaxf(b[3], y); }
+static void plain_box(const Item *it, float *b) { /* the box of the stored points; bbox() adds a connector's route and label */
     b[0] = fminf(it->x0, it->x1); b[1] = fminf(it->y0, it->y1);
     b[2] = fmaxf(it->x0, it->x1); b[3] = fmaxf(it->y0, it->y1);
-    for (int k = 0; is_pen(it->type) && k < it->np; k++) {
-        float x, y; pen_pt(it, k, &x, &y);
-        b[0] = fminf(b[0], x); b[1] = fminf(b[1], y); b[2] = fmaxf(b[2], x); b[3] = fmaxf(b[3], y);
+    for (int k = 0; is_pen(it->type) && k < it->np; k++) { float x, y; pen_pt(it, k, &x, &y); extend(b, x, y); }
+}
+static void conn_pt(const Item *it, int k, float *x, float *y) { /* 0 is the start, np + 1 the end, the waypoints between */
+    if (!k) { *x = it->x0; *y = it->y0; }
+    else if (k > it->np) { *x = it->x1; *y = it->y1; }
+    else { *x = it->ox + pool[it->p0 + 2 * k - 2] * it->sx; *y = it->oy + pool[it->p0 + 2 * k - 1] * it->sy; }
+}
+static int vertical_end(int link, float x, float y, float tx, float ty) { /* does the route meet (x, y) vertically? */
+    if (!link) return fabsf(ty - y) > fabsf(tx - x);
+    float b[4]; plain_box(&items[link - 1], b); /* plain: a route here would overwrite the one being built */
+    return fabsf(y - (b[1] + b[3]) / 2) * fmaxf(b[2] - b[0], 1) > fabsf(x - (b[0] + b[2]) / 2) * fmaxf(b[3] - b[1], 1);
+}
+static float *route; static int caproute;
+/* A connector's polyline into route, valid until the next call: start, waypoints, end. ELBOW turns
+   each step into right angles: an L between points, a Z into a linked end that it meets head on. */
+static int conn_route(const Item *it) {
+    int m = it->np + 2, n = 0;
+    route = grow(route, &caproute, 6 * m + 2, sizeof *route);
+    float px, py, qx, qy; conn_pt(it, 0, &px, &py);
+    route[n++] = px; route[n++] = py;
+    if (!(it->style & ELBOW)) {
+        for (int k = 1; k < m; k++, n += 2) conn_pt(it, k, &route[n], &route[n + 1]);
+        return n / 2;
     }
+    conn_pt(it, 1, &qx, &qy);
+    int v = vertical_end(it->from, px, py, qx, qy);
+    for (int k = 1; k < m; k++, px = qx, py = qy) {
+        conn_pt(it, k, &qx, &qy);
+        if (px != qx && py != qy) {
+            int last = k == m - 1, enter = last && it->to ? vertical_end(it->to, qx, qy, px, py) : !v;
+            if (last && enter == v) {
+                if (v) { route[n++] = px; route[n++] = (py + qy) / 2; route[n++] = qx; route[n++] = (py + qy) / 2; }
+                else { route[n++] = (px + qx) / 2; route[n++] = py; route[n++] = (px + qx) / 2; route[n++] = qy; }
+            } else { route[n++] = v ? px : qx; route[n++] = v ? qy : py; v = !v; }
+        } else v = px == qx;
+        route[n++] = qx; route[n++] = qy;
+    }
+    return n / 2;
+}
+static void route_mid(int n, float *x, float *y) { /* the point halfway along route */
+    float total = 0;
+    for (int k = 0; k + 1 < n; k++) total += hypotf(route[2 * k + 2] - route[2 * k], route[2 * k + 3] - route[2 * k + 1]);
+    *x = route[0]; *y = route[1]; total /= 2;
+    for (int k = 0; k + 1 < n; k++) {
+        float dx = route[2 * k + 2] - route[2 * k], dy = route[2 * k + 3] - route[2 * k + 1], l = hypotf(dx, dy);
+        if (l >= total && l > 0) { *x = route[2 * k] + dx * total / l; *y = route[2 * k + 1] + dy * total / l; return; }
+        total -= l;
+    }
+}
+static int conn_label(const Item *it, float *b, float *cx, float *top) { /* the label backdrop, halfway along the route; 0 without a label */
+    if (!it->label) return 0;
+    float x, y, px = lsize(it) * 7, h, w = text_run(&canvas_font, 0, 0, px, tstr(it->label), 0, &h);
+    route_mid(conn_route(it), &x, &y);
+    b[0] = x - w / 2 - 6; b[1] = y - h / 2 - 2; b[2] = x + w / 2 + 6; b[3] = y + h / 2 + 2;
+    if (cx) { *cx = x; *top = y - h / 2; }
+    return 1;
+}
+static void bbox(const Item *it, float *b) {
+    plain_box(it, b);
+    if (!connector(it->type)) return;
+    float lb[4];
+    for (int n = conn_route(it), k = 0; k < n; k++) extend(b, route[2 * k], route[2 * k + 1]);
+    if (conn_label(it, lb, NULL, NULL)) { extend(b, lb[0], lb[1]); extend(b, lb[2], lb[3]); }
 }
 static int poly(const Item *it, float *p) { /* closed outline of a fillable shape, at most 64 points */
     float cx = (it->x0 + it->x1) / 2, cy = (it->y0 + it->y1) / 2, rx = fabsf(it->x1 - it->x0) / 2, ry = fabsf(it->y1 - it->y0) / 2;
     switch (it->type) {
-    case RECT: memcpy(p, (float[]){ it->x0, it->y0, it->x1, it->y0, it->x1, it->y1, it->x0, it->y1 }, 8 * sizeof *p); return 4;
+    case RECT: case TABLE: memcpy(p, (float[]){ it->x0, it->y0, it->x1, it->y0, it->x1, it->y1, it->x0, it->y1 }, 8 * sizeof *p); return 4;
     case DIAMOND: memcpy(p, (float[]){ cx, it->y0, it->x1, cy, cx, it->y1, it->x0, cy }, 8 * sizeof *p); return 4;
     case TRIANGLE: memcpy(p, (float[]){ cx, it->y0, it->x1, it->y1, it->x0, it->y1 }, 6 * sizeof *p); return 3;
     case STAR: /* a unit star spans x +-0.951 and y -1..0.809; stretch it to fill the box */
@@ -243,8 +356,11 @@ static int touches(const Item *it, float wx, float wy, int edges) { /* edges: un
         }
         return 0;
     case LINE: case ARROW:
-        return seg_dist(wx, wy, it->x0, it->y0, it->x1, it->y1) < tol;
-    case TEXT: break;
+        if (conn_label(it, b, NULL, NULL) && wx > b[0] && wx < b[2] && wy > b[1] && wy < b[3]) return 1;
+        for (int n = conn_route(it), k = 0; k + 1 < n; k++)
+            if (seg_dist(wx, wy, route[2 * k], route[2 * k + 1], route[2 * k + 2], route[2 * k + 3]) < tol) return 1;
+        return 0;
+    case TEXT: case TABLE: break;
     default:
         if (!edges || it->fill >= 0) break;
         for (int n = poly(it, p), k = 0; k < n; k++)
@@ -259,25 +375,45 @@ static int hit(float wx, float wy) {
     for (int i = nitems - 1; i >= 0; i--) if (touches(&items[i], wx, wy, 0)) return i;
     return -1;
 }
-static int connector(int t) { return t == LINE || t == ARROW; }
 static int link_target(float wx, float wy, int skip) { /* topmost item a connector end can link to, or -1 */
     for (int i = nitems - 1; i >= 0; i--) if (i != skip && !connector(items[i].type) && touches(&items[i], wx, wy, 0)) return i;
     return -1;
 }
-static float edge_t(const float *b, float dx, float dy) { /* fraction of (dx, dy) from the box center to its edge */
-    float hw = (b[2] - b[0]) / 2, hh = (b[3] - b[1]) / 2;
-    return fminf(dx ? hw / fabsf(dx) : 1e30f, dy ? hh / fabsf(dy) : 1e30f);
+static float outline_t(const Item *it, float ox, float oy, float dx, float dy) { /* the last t where o + t d crosses the outline */
+    float p[128], best = 0; int n = 4;
+    if (fillable(it->type)) n = poly(it, p);
+    else { float b[4]; plain_box(it, b); memcpy(p, (float[]){ b[0], b[1], b[2], b[1], b[2], b[3], b[0], b[3] }, 8 * sizeof *p); }
+    for (int k = 0; k < n; k++) {
+        float ax = p[2 * k] - ox, ay = p[2 * k + 1] - oy, ex = p[2 * ((k + 1) % n)] - p[2 * k], ey = p[2 * ((k + 1) % n) + 1] - p[2 * k + 1];
+        float den = dx * ey - dy * ex;
+        if (fabsf(den) < 1e-9f) continue;
+        float t = (ax * ey - ay * ex) / den, s = (ax * dy - ay * dx) / den;
+        if (s >= 0 && s <= 1 && t > best) best = t;
+    }
+    return best;
 }
-static void relink_one(Item *it) { /* a linked end sits just outside its item's box, on the line toward the other end */
-    float a[4] = { it->x0, it->y0, it->x0, it->y0 }, b[4] = { it->x1, it->y1, it->x1, it->y1 };
-    if (it->from) bbox(&items[it->from - 1], a);
-    if (it->to) bbox(&items[it->to - 1], b);
-    float ax = (a[0] + a[2]) / 2, ay = (a[1] + a[3]) / 2, bx = (b[0] + b[2]) / 2, by = (b[1] + b[3]) / 2;
-    float dx = bx - ax, dy = by - ay, len = hypotf(dx, dy), ta = 0, tb = 0;
-    if (len > 0 && it->from) ta = edge_t(a, dx, dy) + 8 / len;
-    if (len > 0 && it->to) tb = edge_t(b, dx, dy) + 8 / len;
-    if (ta + tb >= 1) ta = tb = 0; /* ponytail: overlapping boxes connect center to center */
-    it->x0 = ax + dx * ta; it->y0 = ay + dy * ta; it->x1 = bx - dx * tb; it->y1 = by - dy * tb;
+static void anchor(int link, float tx, float ty, int elbow, float *x, float *y) { /* 8 units outside the outline, facing (tx, ty) */
+    const Item *t = &items[link - 1]; float b[4]; plain_box(t, b);
+    float cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2, dx = tx - cx, dy = ty - cy;
+    if (elbow) { if (fabsf(dx) * (b[3] - b[1]) >= fabsf(dy) * (b[2] - b[0])) dy = 0; else dx = 0; } /* leave from a side's middle */
+    float len = hypotf(dx, dy), k = len > 1e-6f ? outline_t(t, cx, cy, dx, dy) + 8 / len : 0;
+    *x = cx + dx * k; *y = cy + dy * k;
+}
+static void center(int link, float x, float y, float *cx, float *cy) { /* a linked item's center, else the point itself */
+    float b[4] = { x, y, x, y };
+    if (link) plain_box(&items[link - 1], b);
+    *cx = (b[0] + b[2]) / 2; *cy = (b[1] + b[3]) / 2;
+}
+static void relink_one(Item *it) { /* each linked end faces its neighbor: the next waypoint, else the other end */
+    float sx, sy, ex, ey, ax = it->x0, ay = it->y0, bx = it->x1, by = it->y1;
+    if (it->np) { conn_pt(it, 1, &sx, &sy); conn_pt(it, it->np, &ex, &ey); }
+    else { center(it->to, it->x1, it->y1, &sx, &sy); center(it->from, it->x0, it->y0, &ex, &ey); }
+    if (it->from) anchor(it->from, sx, sy, it->style & ELBOW, &ax, &ay);
+    if (it->to) anchor(it->to, ex, ey, it->style & ELBOW, &bx, &by);
+    if (!it->np && it->from && it->to && (bx - ax) * (sx - ex) + (by - ay) * (sy - ey) <= 0) { /* the ends crossed */
+        ax = ex; ay = ey; bx = sx; by = sy; /* ponytail: overlapping items connect center to center */
+    }
+    it->x0 = ax; it->y0 = ay; it->x1 = bx; it->y1 = by;
 }
 static void relink(void) { for (int i = 0; i < nitems; i++) if (items[i].from || items[i].to) relink_one(&items[i]); }
 static void compact(const char *gone) { /* drop items with gone[i]; links follow the shifted indices or come free */
@@ -289,14 +425,29 @@ static void compact(const char *gone) { /* drop items with gone[i]; links follow
         Item it = items[i];
         if (it.from) it.from = at[it.from - 1];
         if (it.to) it.to = at[it.to - 1];
+        if (it.parent) it.parent = at[it.parent - 1];
         items[n++] = it;
     }
     nitems = n; free(at);
 }
 static void remove_item(int i) { char *gone = calloc(nitems + 1, 1); gone[i] = 1; compact(gone); free(gone); }
+static int held(const Item *b, int i) { /* selected, or inside a selected container */
+    for (int d = 0; i >= 0 && d <= MAX_DEPTH; d++, i = b[i].parent - 1) if (b[i].sel) return 1;
+    return 0;
+}
+static int moving(const Item *b, int i) { /* held, or a connector with waypoints whose two linked ends both move */
+    const Item *it = &b[i];
+    return held(b, i) || (connector(it->type) && it->np && it->from && it->to && held(b, it->from - 1) && held(b, it->to - 1));
+}
 static void keep_links(Item *it, const Item *b) { /* a moved connector stays linked only to items moving with it */
-    if (it->from && !b[it->from - 1].sel) it->from = 0;
-    if (it->to && !b[it->to - 1].sel) it->to = 0;
+    if (it->from && !held(b, it->from - 1)) it->from = 0;
+    if (it->to && !held(b, it->to - 1)) it->to = 0;
+}
+static void shift(Item *it, float dx, float dy) { it->x0 += dx; it->x1 += dx; it->y0 += dy; it->y1 += dy; it->ox += dx; it->oy += dy; }
+static int depth(const int *parent, int i) { /* containers above item i; more than MAX_DEPTH means too deep or a loop */
+    int d = 0;
+    while (parent[i] && d <= MAX_DEPTH) { i = parent[i] - 1; d++; }
+    return d;
 }
 static int nsel(void) { int n = 0; for (int i = 0; i < nitems; i++) n += items[i].sel; return n; }
 static void select_none(void) { for (int i = 0; i < nitems; i++) items[i].sel = 0; }
@@ -318,43 +469,71 @@ static int sel_frame(float *b) { /* selection box with room for stroke width and
 
 /* ---- text items: tpool + p0 is a NUL-terminated UTF-8 string ---- */
 static float tpx(const Item *it) { return it->width * 7; }
-static void measure(Item *it) {
-    float h, w = text_run(&canvas_font, 0, 0, tpx(it), tpool + it->p0, 0, &h);
+static int table_rows(const Item *it, float *h) { /* row heights from the wrapped cells; returns the row count */
+    int rows = it->np / it->cols; float px = lsize(it) * 7, cw = fabsf(it->x1 - it->x0) / it->cols;
+    const char *s = tpool + it->p0;
+    for (int r = 0; r < rows; r++) {
+        h[r] = 0;
+        for (int c = 0; c < it->cols; c++, s += strlen(s) + 1) {
+            float th; text_run(&canvas_font, 0, 0, px, wrap_copy(s, px, cw - 16), 0, &th); h[r] = fmaxf(h[r], th + 16);
+        }
+    }
+    return rows;
+}
+static void measure(Item *it) { /* text and tables size themselves */
+    if (it->type == TABLE) {
+        float h[MAX_ROWS]; it->y1 = it->y0;
+        for (int r = 0, rows = table_rows(it, h); r < rows; r++) it->y1 += h[r];
+        return;
+    }
+    float h, w = text_run(&canvas_font, 0, 0, tpx(it), wrap_copy(tpool + it->p0, tpx(it), it->wrap), 0, &h);
     it->x1 = it->x0 + fmaxf(w, tpx(it) * .3f); it->y1 = it->y0 + h;
 }
-static int caret; /* byte offset of the caret in the text being edited */
+/* The edit types into the pool tail: a text item's bytes, or with edit_label the item's label. */
+static int caret, edit_label, label_len; /* caret: byte offset in the edited string */
+static char *edit_s(void) { return edit_label ? tpool + items[editing].label - 1 : tpool + items[editing].p0; }
+static int *edit_n(void) { return edit_label ? &label_len : &items[editing].np; }
+static void edit_changed(void) { if (!edit_label) measure(&items[editing]); relink(); }
 static void text_put(const char *b, int n) { /* insert at the caret; the edited text is the pool tail */
     tpool = grow(tpool, &captpool, ntpool + n + 1, 1);
-    char *s = tpool + items[editing].p0;
-    memmove(s + caret + n, s + caret, items[editing].np - caret); memcpy(s + caret, b, n);
+    char *s = edit_s();
+    memmove(s + caret + n, s + caret, *edit_n() - caret); memcpy(s + caret, b, n);
     ntpool += n; tpool[ntpool] = 0; caret += n;
-    items[editing].np += n; measure(&items[editing]); relink();
+    *edit_n() += n; edit_changed();
 }
 static int text_step(int at, int dir) { /* neighbouring codepoint boundary */
-    const char *s = tpool + items[editing].p0; int np = items[editing].np;
+    const char *s = edit_s(); int np = *edit_n();
     if (dir < 0 && at > 0) do at--; while (at && (s[at] & 0xc0) == 0x80);
     if (dir > 0 && at < np) do at++; while (at < np && (s[at] & 0xc0) == 0x80);
     return at;
 }
 static void text_cut(int a, int b) { /* remove bytes [a, b) and leave the caret at a */
-    Item *it = &items[editing]; char *s = tpool + it->p0;
-    memmove(s + a, s + b, it->np - b); it->np -= b - a; ntpool -= b - a;
-    tpool[ntpool] = 0; caret = a; measure(it); relink();
+    char *s = edit_s();
+    memmove(s + a, s + b, *edit_n() - b); *edit_n() -= b - a; ntpool -= b - a;
+    tpool[ntpool] = 0; caret = a; edit_changed();
 }
 static void text_del(void) { text_cut(text_step(caret, -1), caret); } /* backspace */
 static void start_edit(int i) { /* re-append the bytes at the tail so older snapshots keep their copy */
     Item *it = &items[i]; int old = it->p0;
     tpool = grow(tpool, &captpool, ntpool + it->np + 2, 1);
     memcpy(tpool + ntpool, tpool + old, it->np);
-    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i; caret = it->np;
+    it->p0 = ntpool; ntpool += it->np; tpool[ntpool] = 0; editing = i; edit_label = 0; caret = it->np;
     editing_new = nundo && i >= undo[nundo - 1].n; measure(it);
+}
+static void start_label_edit(int i) { /* the same for a shape's or connector's label */
+    Item *it = &items[i]; label_len = it->label ? strlen(tstr(it->label)) : 0;
+    tpool = grow(tpool, &captpool, ntpool + label_len + 2, 1);
+    if (it->label) memcpy(tpool + ntpool, tstr(it->label), label_len);
+    editing_new = !it->label; it->label = ntpool + 1; ntpool += label_len; tpool[ntpool] = 0;
+    editing = i; edit_label = 1; caret = label_len;
 }
 static void end_edit(void) {
     if (editing < 0) return;
-    if (items[editing].np) ntpool++;   /* commit the NUL */
-    else if (editing_new) restore(undo[--nundo]); /* cancel a new empty item */
+    if (*edit_n()) ntpool++;   /* commit the NUL */
+    else if (editing_new) restore(undo[--nundo]); /* cancel a new empty item or label */
+    else if (edit_label) { items[editing].label = 0; relink(); } /* erasing a label removes it */
     else remove_item(editing); /* erasing existing text is an undoable deletion */
-    editing = -1;
+    editing = -1; edit_label = 0;
 }
 
 /* ---- transforms ---- */
@@ -362,8 +541,10 @@ static void xform(Item *it, const Item *b, float ax, float ay, float fx, float f
     *it = *b;
     it->x0 = ax + (b->x0 - ax) * fx; it->x1 = ax + (b->x1 - ax) * fx;
     it->y0 = ay + (b->y0 - ay) * fy; it->y1 = ay + (b->y1 - ay) * fy;
+    it->ox = ax + (b->ox - ax) * fx; it->oy = ay + (b->oy - ay) * fy;
     it->sx = b->sx * fx; it->sy = b->sy * fy;
-    if (it->type == TEXT) { it->width = fminf(64, fmaxf(1, b->width * sqrtf(fabsf(fx * fy)))); measure(it); }
+    if (it->type == TEXT) { it->width = fminf(64, fmaxf(1, b->width * sqrtf(fabsf(fx * fy)))); it->wrap = b->wrap * fabsf(fx); measure(it); }
+    if (it->type == TABLE) measure(it);
 }
 static void delete_selected(void) {
     if (!nsel()) return;
@@ -372,9 +553,18 @@ static void delete_selected(void) {
     compact(gone); free(gone);
 }
 static int *copy_at; static int capcopy_at; /* original index -> copy position + 1, while copying a selection */
-static void copy_links(Item *c) { /* a copied connector keeps only links to items copied with it */
+static void copy_links(Item *c) { /* a copy keeps only links to items copied with it, and no id: ids are unique */
     if (c->from) c->from = copy_at[c->from - 1];
     if (c->to) c->to = copy_at[c->to - 1];
+    if (c->parent) c->parent = copy_at[c->parent - 1];
+    c->id = 0;
+}
+static int has_points(const Item *it) { return is_pen(it->type) || connector(it->type); }
+static int text_bytes(const Item *it, const char *s) { /* a text item's or table's bytes in its pool, NULs included */
+    int n = 0;
+    if (it->type == TEXT) return it->np + 1;
+    for (int k = 0; it->type == TABLE && k < it->np; k++) n += strlen(s + n) + 1;
+    return n;
 }
 static void map_selection(void) {
     copy_at = grow(copy_at, &capcopy_at, nitems + 1, sizeof *copy_at);
@@ -388,25 +578,32 @@ static void duplicate(void) {
     for (int i = 0; i < n; i++) {
         if (!items[i].sel) continue;
         Item c = items[i]; items[i].sel = 0; copy_links(&c);
-        c.x0 += GRID; c.x1 += GRID; c.y0 += GRID; c.y1 += GRID; add_item(c);
+        shift(&c, GRID, GRID); add_item(c);
     }
 }
 static float *clip_pts; static int nclip_pts, capclip_pts;
 static char *clip_txt; static int nclip_txt, capclip_txt;
 static float clip_x, clip_y; /* top left of the copied selection; bbox() cannot read clip_pts */
+static int clip_text(const char *s, int n) { /* n bytes into clip_txt; returns their offset */
+    clip_txt = grow(clip_txt, &capclip_txt, nclip_txt + n, 1); memcpy(clip_txt + nclip_txt, s, n);
+    nclip_txt += n; return nclip_txt - n;
+}
+static int paste_text(const char *s, int n) { /* n bytes onto the tpool tail; returns their offset */
+    tpool = grow(tpool, &captpool, ntpool + n + 1, 1); memcpy(tpool + ntpool, s, n);
+    ntpool += n; return ntpool - n;
+}
 static void copy_sel(void) { /* pools belong to one tab, so the clipboard keeps its own copy of points and text */
     float b[4]; sel_bbox(b); clip_x = b[0]; clip_y = b[1];
     clip = realloc(clip, (nsel() + 1) * sizeof(Item)); nclip = nclip_pts = nclip_txt = 0; map_selection();
     for (int i = 0; i < nitems; i++) {
         if (!items[i].sel) continue;
         Item c = items[i]; copy_links(&c); /* links now count clipboard positions */
-        if (is_pen(c.type)) {
+        if (has_points(&c) && c.np) {
             clip_pts = grow(clip_pts, &capclip_pts, nclip_pts + 2 * c.np, sizeof *clip_pts);
             memcpy(clip_pts + nclip_pts, pool + c.p0, 2 * c.np * sizeof *pool); c.p0 = nclip_pts; nclip_pts += 2 * c.np;
-        } else if (c.type == TEXT) {
-            clip_txt = grow(clip_txt, &capclip_txt, nclip_txt + c.np + 1, 1);
-            memcpy(clip_txt + nclip_txt, tpool + c.p0, c.np + 1); c.p0 = nclip_txt; nclip_txt += c.np + 1;
-        }
+        } else if (c.type == TEXT || c.type == TABLE) c.p0 = clip_text(tpool + c.p0, text_bytes(&c, tpool + c.p0));
+        if (c.label) c.label = clip_text(tstr(c.label), strlen(tstr(c.label)) + 1) + 1;
+        if (c.caption) c.caption = clip_text(tstr(c.caption), strlen(tstr(c.caption)) + 1) + 1;
         clip[nclip++] = c;
     }
 }
@@ -418,12 +615,12 @@ static void paste(float wx, float wy) {
         Item c = clip[k]; c.sel = 1;
         if (c.from) c.from += at;
         if (c.to) c.to += at;
-        c.x0 += dx; c.x1 += dx; c.y0 += dy; c.y1 += dy;
-        if (is_pen(c.type)) { int at = c.p0; c.p0 = npool; for (int j = 0; j < c.np; j++) add_pt(clip_pts[at + 2 * j], clip_pts[at + 2 * j + 1]); }
-        else if (c.type == TEXT) {
-            tpool = grow(tpool, &captpool, ntpool + c.np + 2, 1);
-            memcpy(tpool + ntpool, clip_txt + c.p0, c.np + 1); c.p0 = ntpool; ntpool += c.np + 1;
-        }
+        if (c.parent) c.parent += at;
+        shift(&c, dx, dy);
+        if (has_points(&c) && c.np) { int at = c.p0; c.p0 = npool; for (int j = 0; j < c.np; j++) add_pt(clip_pts[at + 2 * j], clip_pts[at + 2 * j + 1]); }
+        else if (c.type == TEXT || c.type == TABLE) c.p0 = paste_text(clip_txt + c.p0, text_bytes(&c, clip_txt + c.p0));
+        if (c.label) c.label = paste_text(clip_txt + c.label - 1, strlen(clip_txt + c.label - 1) + 1) + 1;
+        if (c.caption) c.caption = paste_text(clip_txt + c.caption - 1, strlen(clip_txt + c.caption - 1) + 1) + 1;
         add_item(c);
     }
 }
@@ -436,6 +633,49 @@ static void set_fill(int c) {
     fillc = c;
     if (!nsel()) return;
     checkpoint(); for (int i = 0; i < nitems; i++) if (items[i].sel && fillable(items[i].type)) items[i].fill = c;
+}
+static int tool_style; /* DASHED and ELBOW for new items; window-wide like the stroke color */
+static int styled(int t, int bit) { return bit == ELBOW ? connector(t) : connector(t) || fillable(t); }
+static int shown_style(int bit) { /* the first selected item that takes the style, else the tool default */
+    for (int i = 0; i < nitems; i++) if (items[i].sel && styled(items[i].type, bit)) return items[i].style & bit;
+    return tool_style & bit;
+}
+static void toggle_style(int bit) {
+    int on = !shown_style(bit), any = 0;
+    tool_style = on ? tool_style | bit : tool_style & ~bit;
+    for (int i = 0; i < nitems; i++) any |= items[i].sel && styled(items[i].type, bit);
+    if (!any) return;
+    checkpoint();
+    for (int i = 0; i < nitems; i++) if (items[i].sel && styled(items[i].type, bit)) items[i].style = on ? items[i].style | bit : items[i].style & ~bit;
+    relink();
+}
+static void insert_item(int at, Item it) { /* links and parents follow the shifted indices */
+    add_item(it);
+    memmove(items + at + 1, items + at, (nitems - 1 - at) * sizeof *items); items[at] = it;
+    for (int i = 0; i < nitems; i++) {
+        if (items[i].from > at) items[i].from++;
+        if (items[i].to > at) items[i].to++;
+        if (items[i].parent > at) items[i].parent++;
+    }
+}
+static int nesting_ok(void);
+static void frame_selection(void) { /* a dashed container just behind the selection, holding it */
+    float b[4]; int first = -1, outer = -1;
+    if (!sel_bbox(b)) return;
+    for (int i = 0; i < nitems; i++) {
+        if (!items[i].sel) continue;
+        if (first < 0) first = i;
+        if (items[i].parent && items[items[i].parent - 1].sel) continue; /* it moves with a selected container already */
+        outer = outer < 0 || outer == items[i].parent ? items[i].parent : 0; /* the frame joins a container they share */
+    }
+    checkpoint();
+    /* 40 units on top leave room for a label */
+    insert_item(first, (Item){ .type = RECT, .color = 7, .fill = -1, .width = 2, .sx = 1, .sy = 1, .style = DASHED, .parent = outer,
+                               .x0 = snapf(b[0] - 20), .y0 = snapf(b[1] - 40), .x1 = snapf(b[2] + 20), .y1 = snapf(b[3] + 20), .p0 = npool });
+    for (int i = first + 1; i < nitems; i++)
+        if (items[i].sel && (!items[i].parent || !items[items[i].parent - 1].sel)) items[i].parent = first + 1;
+    if (!nesting_ok()) { restore(undo[--nundo]); notify("Containers can nest at most %d deep", MAX_DEPTH); return; }
+    select_none(); items[first].sel = 1;
 }
 static void reset_board(void) { /* undoable, so a misclick costs one Ctrl+Z */
     end_edit();
@@ -478,7 +718,7 @@ static int width_kind(void) { /* TEXT, HIGHLIGHT, or PEN for any other stroke: p
     return k >= 0 ? k : tool == TEXT || tool == HIGHLIGHT ? tool : PEN;
 }
 static float shown_width(void) { /* the edited or first selected item, else the tool default */
-    if (editing >= 0) return items[editing].width;
+    if (editing >= 0) return edit_label ? lsize(&items[editing]) : items[editing].width;
     for (int i = 0; i < nitems; i++) if (items[i].sel) return items[i].width;
     return width;
 }
@@ -519,7 +759,25 @@ static void rrect(float x, float y, float w, float h, float r) {
     fill(x + r, y, w - 2 * r, h); fill(x, y + r, w, h - 2 * r);
     dot(x + r, y + r, r); dot(x + w - r, y + r, r); dot(x + w - r, y + h - r, r); dot(x + r, y + h - r, r);
 }
+static float dash; /* > 0: stroke() draws dashes this long with round caps, and gaps of dash + w */
+static void dashes(const float *xy, int n, int closed, float w) {
+    float left = dash; int on = 1;
+    for (int i = 0; i + 1 < n + closed; i++) {
+        float ax = xy[2 * i], ay = xy[2 * i + 1], bx = xy[2 * ((i + 1) % n)], by = xy[2 * ((i + 1) % n) + 1];
+        float len = hypotf(bx - ax, by - ay), dx = len > 0 ? (bx - ax) / len : 0, dy = len > 0 ? (by - ay) / len : 0;
+        for (float t = 0; t < len; ) {
+            float step = fminf(left, len - t);
+            if (on) {
+                seg(ax + dx * t, ay + dy * t, ax + dx * (t + step), ay + dy * (t + step), w);
+                dot(ax + dx * t, ay + dy * t, w / 2); dot(ax + dx * (t + step), ay + dy * (t + step), w / 2);
+            }
+            t += step; left -= step;
+            if (left <= 0) { on = !on; left = on ? dash : dash + w; }
+        }
+    }
+}
 static void stroke(const float *xy, int n, int closed, float w) {
+    if (dash > 0) { dashes(xy, n, closed, w); return; }
     for (int i = 0; i < n; i++) {
         dot(xy[2 * i], xy[2 * i + 1], w / 2);
         if (i + 1 < n) seg(xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], w);
@@ -530,7 +788,60 @@ static void outline(const float *b, float m, float w) {
     float r[8] = { b[0] - m, b[1] - m, b[2] + m, b[1] - m, b[2] + m, b[3] + m, b[0] - m, b[3] + m };
     stroke(r, 4, 1, w);
 }
-static void draw_item(const Item *it) {
+static char *haskids; static int caphaskids; /* haskids[i]: item i is a container; mark_containers() refreshes it */
+static void mark_containers(void) {
+    haskids = grow(haskids, &caphaskids, nitems + 1, 1); memset(haskids, 0, nitems + 1);
+    for (int i = 0; i < nitems; i++) if (items[i].parent) haskids[items[i].parent - 1] = 1;
+}
+static float dash_len(const Item *it) { return it->style & DASHED ? fmaxf(6, it->width * 2) : 0; }
+static void arrow_head(const Item *it, int n, float *head) { /* along the last route segment that has a length */
+    int k = n - 1;
+    while (k > 1 && route[2 * k - 2] == route[2 * k] && route[2 * k - 1] == route[2 * k + 1]) k--;
+    float x = route[2 * k], y = route[2 * k + 1], a = atan2f(y - route[2 * k - 1], x - route[2 * k - 2]), h = fmaxf(12, it->width * 4);
+    float r[6] = { x - h * cosf(a - .5f), y - h * sinf(a - .5f), x, y, x - h * cosf(a + .5f), y - h * sinf(a + .5f) };
+    memcpy(head, r, sizeof r);
+}
+/* A shape's label: centered lines, wrapped to the share of the width the shape gives text; in a
+   container, left-aligned at the top. The caption follows in smaller gray text. */
+static float label_layout(const Item *it, int container, float *x, float *y, float *wrap) {
+    float b[4]; plain_box(it, b);
+    float w = b[2] - b[0], px = lsize(it) * 7, h = 0;
+    float share = it->type == RECT ? 1 : it->type == ELLIPSE ? .72f : it->type == STAR ? .4f : .5f;
+    if (container) { *x = b[0] + 12; *y = b[1] + 8; *wrap = fmaxf(w - 24, px); return 0; }
+    *wrap = fmaxf(w * share - 16, px); *x = (b[0] + b[2]) / 2;
+    if (it->label) h += text_lines(tstr(it->label), 0, 0, px, *wrap, 1, 0, NULL);
+    if (it->caption) h += text_lines(tstr(it->caption), 0, 0, px * .75f, *wrap, 1, 0, NULL) + 2;
+    *y = (b[1] + b[3] - h) / 2 + (it->type == TRIANGLE ? (b[3] - b[1]) / 6 : 0);
+    return 1;
+}
+static void shape_text(const Item *it, int container, FILE *svg) { /* label and caption; GL, or SVG when svg is set */
+    float x, y, wrap, px = lsize(it) * 7; int centered = label_layout(it, container, &x, &y, &wrap);
+    if (it->label) {
+        if (svg) fprintf(svg, "<g font-size=\"%.2f\" fill=\"#%06x\">", px * canvas_font.em, STROKE[0]); else hex(STROKE[0]);
+        y += text_lines(tstr(it->label), x, y, px, wrap, centered, !svg, svg) + 2;
+        if (svg) fputs("</g>\n", svg);
+    }
+    if (it->caption) {
+        if (svg) fprintf(svg, "<g font-size=\"%.2f\" fill=\"#%06x\">", px * .75f * canvas_font.em, STROKE[7]); else hex(STROKE[7]);
+        text_lines(tstr(it->caption), x, y, px * .75f, wrap, centered, !svg, svg);
+        if (svg) fputs("</g>\n", svg);
+    }
+}
+static void draw_table(const Item *it) {
+    float h[MAX_ROWS], l = fminf(it->x0, it->x1), r = fmaxf(it->x0, it->x1), cw = (r - l) / it->cols, y = it->y0, px = lsize(it) * 7;
+    int rows = table_rows(it, h);
+    if (it->fill >= 0) { hex(FILLC[it->fill]); fill(l, y, r - l, h[0]); }
+    hex(STROKE[0]);
+    const char *s = tpool + it->p0;
+    for (int row = 0; row < rows; y += h[row++])
+        for (int c = 0; c < it->cols; c++, s += strlen(s) + 1) text_lines(s, l + c * cw + 8, y + 8, px, cw - 16, 0, 1, NULL);
+    hex(STROKE[it->color]);
+    float box[8] = { l, it->y0, r, it->y0, r, it->y1, l, it->y1 }; stroke(box, 4, 1, it->width);
+    y = it->y0;
+    for (int row = 0; row + 1 < rows; row++) { y += h[row]; seg(l, y, r, y, it->width * .6f); }
+    for (int c = 1; c < it->cols; c++) seg(l + c * cw, it->y0, l + c * cw, it->y1, it->width * .6f);
+}
+static void draw_item(const Item *it, int container) {
     float w = it->width, buf[128];
     hex(STROKE[it->color]);
     switch (it->type) {
@@ -545,13 +856,12 @@ static void draw_item(const Item *it) {
         glDisable(GL_STENCIL_TEST);
         break;
     case LINE: case ARROW: {
-        float l[4] = { it->x0, it->y0, it->x1, it->y1 };
-        stroke(l, 2, 0, w);
-        if (it->type == ARROW) {
-            float a = atan2f(it->y1 - it->y0, it->x1 - it->x0), h = fmaxf(12, w * 4);
-            float head[6] = { it->x1 - h * cosf(a - .5f), it->y1 - h * sinf(a - .5f), it->x1, it->y1,
-                              it->x1 - h * cosf(a + .5f), it->y1 - h * sinf(a + .5f) };
-            stroke(head, 3, 0, w);
+        float head[6], lb[4], cx, top; int n = conn_route(it);
+        dash = dash_len(it); stroke(route, n, 0, w); dash = 0;
+        if (it->type == ARROW) { arrow_head(it, n, head); stroke(head, 3, 0, w); }
+        if (conn_label(it, lb, &cx, &top)) { /* a white backdrop keeps the label off the line */
+            hex(0xffffff); rrect(lb[0], lb[1], lb[2] - lb[0], lb[3] - lb[1], 4);
+            hex(STROKE[it->color]); text_lines(tstr(it->label), cx, top, lsize(it) * 7, 0, 1, 1, NULL);
         }
         break;
     }
@@ -564,12 +874,14 @@ static void draw_item(const Item *it) {
             glBegin(GL_TRIANGLE_FAN); glVertex2f(mx, my); for (int i = 0; i <= n; i++) glVertex2fv(buf + 2 * (i % n)); glEnd();
             hex(STROKE[it->color]);
         }
-        stroke(buf, n, 1, w);
+        dash = dash_len(it); stroke(buf, n, 1, w); dash = 0;
+        shape_text(it, container, NULL);
         break;
     }
     case TEXT:
-        text_draw(&canvas_font, it->x0, it->y0, tpx(it), STROKE[it->color], tpool + it->p0);
+        hex(STROKE[it->color]); text_lines(tpool + it->p0, it->x0, it->y0, tpx(it), it->wrap, 0, 1, NULL);
         break;
+    case TABLE: draw_table(it); break;
     }
 }
 static void draw_grid(int ww) {
@@ -599,12 +911,17 @@ static void draw_selection(void) {
 }
 static void draw_caret(void) {
     if (editing < 0) return;
-    const Item *it = &items[editing]; char *s = tpool + it->p0, keep = s[caret];
-    s[caret] = 0; /* measure only the text before the caret */
-    const char *nl = strrchr(s, '\n'); float px = tpx(it); int lines = 1;
-    for (const char *p = s; *p; p++) lines += *p == '\n';
-    float x = it->x0 + text_w(&canvas_font, px, nl ? nl + 1 : s) + 1, y = it->y0 + (lines - 1) * px * 1.25f;
-    s[caret] = keep;
+    const Item *it = &items[editing]; float x = it->x0, y = it->y0, px = tpx(it), wrap = it->wrap, lb[4]; int centered = 0;
+    if (edit_label) {
+        px = lsize(it) * 7; wrap = 0;
+        if (connector(it->type)) { centered = conn_label(it, lb, &x, &y); if (!centered) { route_mid(conn_route(it), &x, &y); y -= px * .6f; centered = 1; } }
+        else centered = label_layout(it, haskids[editing], &x, &y, &wrap);
+    }
+    char *s = wrap_copy(edit_s(), px, wrap), *line = s;
+    for (char *p = s; p < s + caret; p++) if (*p == '\n') { line = p + 1; y += px * 1.25f; }
+    char *end = strchr(line, '\n'); if (end) *end = 0;
+    if (centered) x -= text_w(&canvas_font, px, line) / 2;
+    s[caret] = 0; x += text_w(&canvas_font, px, line) + 1; /* measure only the text before the caret */
     float c[4] = { x, y + px * .1f, x, y + px * 1.1f };
     hex(ACCENT); stroke(c, 2, 0, 1.5f / zoom);
 }
@@ -620,22 +937,32 @@ static void render_canvas(int ww, int decorated) {
     glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, ww, winh, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glTranslatef(panx, pany, 0); glScalef(zoom, zoom, 1);
     if (decorated) draw_grid(ww);
-    for (int i = 0; i < nitems; i++) draw_item(&items[i]);
+    mark_containers();
+    for (int i = 0; i < nitems; i++) draw_item(&items[i], haskids[i]);
     if (decorated) { draw_selection(); draw_caret(); draw_marquee(); }
 }
 
-/* ---- file: "PB04" nitems npool ntpool items[] pool[] tpool[] ---- */
+/* ---- file: "PB05" nitems npool ntpool items[] pool[] tpool[] ---- */
 static int write_board(FILE *f) {
-    return fwrite("PB04", 4, 1, f) == 1 && fwrite(&nitems, 4, 1, f) == 1
+    return fwrite("PB05", 4, 1, f) == 1 && fwrite(&nitems, 4, 1, f) == 1
         && fwrite(&npool, 4, 1, f) == 1 && fwrite(&ntpool, 4, 1, f) == 1
         && fwrite(items, sizeof(Item), nitems, f) == (size_t)nitems
         && fwrite(pool, sizeof(float), npool, f) == (size_t)npool
         && fwrite(tpool, 1, ntpool, f) == (size_t)ntpool && fflush(f) == 0;
 }
-static int save(void) {
+static Stamp stamp_of(const struct stat *st) {
+    return (Stamp){ st->st_mtim.tv_sec, st->st_mtim.tv_nsec, st->st_size, st->st_ino, st->st_dev };
+}
+static int on_disk_changed(void) { /* the file is not the version this tab last read or wrote */
+    struct stat st; Stamp now;
+    if (!path || !disk.ino || stat(path, &st)) return 0;
+    now = stamp_of(&st); return memcmp(&now, &disk, sizeof now) != 0;
+}
+static int save(int force) { /* 0 ok, -1 error, -3 the file changed on disk since this tab read or wrote it */
     struct stat st;
     int exists = stat(path, &st) == 0;
     if (!exists && errno != ENOENT) { perror(path); return -1; }
+    if (!force && on_disk_changed()) return -3;
     /* Resolve existing symlinks so atomic replacement still saves their target. */
     char *target = exists ? realpath(path, NULL) : strdup(path);
     if (!target) { perror(path); return -1; }
@@ -644,11 +971,11 @@ static int save(void) {
     char *tmp = malloc(dirlen + sizeof ".paintboard-XXXXXX");
     if (!tmp) { free(target); perror(path); return -1; }
     memcpy(tmp, target, dirlen); memcpy(tmp + dirlen, ".paintboard-XXXXXX", sizeof ".paintboard-XXXXXX");
-    int fd = mkstemp(tmp), ok = 0, err = errno;
+    int fd = mkstemp(tmp), ok = 0, err = errno; struct stat written;
     if (fd >= 0) {
         FILE *f = fdopen(fd, "wb");
         if (f) {
-            ok = (!exists || fchmod(fd, st.st_mode & 0777) == 0) && write_board(f) && fsync(fd) == 0;
+            ok = (!exists || fchmod(fd, st.st_mode & 0777) == 0) && write_board(f) && fsync(fd) == 0 && !fstat(fd, &written);
             err = errno;
             if (fclose(f) != 0) { ok = 0; err = errno; }
             if (ok && rename(tmp, target) != 0) { ok = 0; err = errno; }
@@ -657,52 +984,78 @@ static int save(void) {
     }
     free(tmp); free(target);
     if (!ok) { errno = err ? err : EIO; perror(path); return -1; }
-    dirty = 0; return 0;
+    dirty = 0; disk = stamp_of(&written); return 0;
 }
 typedef struct { int type, color; float x0, y0, x1, y1, width; int p0, np; } ItemV2; /* PB02 layout */
 typedef struct { int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np; } ItemV3; /* PB03: Item without links */
-static int load(void) { /* 0 ok (missing file = empty board), -1 corrupt, -2 open error */
-    FILE *f = fopen(path, "rb"); char magic[4] = {0}; int n = 0, np = 0, nt = 0;
-    if (!f) { if (errno == ENOENT) return 0; perror(path); return -2; }
-    int got = fread(magic, 4, 1, f) == 1, v2 = got && !memcmp(magic, "PB02", 4), v3 = got && !memcmp(magic, "PB03", 4);
-    int ok = (v2 || v3 || !memcmp(magic, "PB04", 4))
-             && fread(&n, 4, 1, f) == 1 && fread(&np, 4, 1, f) == 1 && fread(&nt, 4, 1, f) == 1
+typedef struct { int type, color, fill, sel; float x0, y0, x1, y1, width, sx, sy; int p0, np, from, to; } ItemV4; /* PB04: no ids, labels, styles */
+static int str_at(const char *t, int nt, int off, int max) { /* a string of 1 to max bytes at tpool offset + 1 off */
+    if (off < 1 || off > nt) return 0;
+    const char *s = t + off - 1, *e = memchr(s, 0, nt - off + 1);
+    return e && e > s && e - s <= max;
+}
+static int item_ok(const Item *it, int i, int n, int np, int nt, const char *txt) {
+    int t = it->type, at = it->p0;
+    if (t < 0 || t >= SELECT || it->color < 0 || it->color >= NCOLORS || it->fill < -1 || it->fill >= NCOLORS
+        || !(it->width >= 1 && it->width <= 64) || !isfinite(it->x0) || !isfinite(it->y0) || !isfinite(it->x1) || !isfinite(it->y1)
+        || !isfinite(it->sx) || !isfinite(it->sy) || !isfinite(it->ox) || !isfinite(it->oy) || it->p0 < 0 || it->np < 0) return 0;
+    if (is_pen(t) ? !it->np || it->p0 > np || it->np > (np - it->p0) / 2 : connector(t) && it->np && (it->p0 > np || it->np > (np - it->p0) / 2)) return 0;
+    if (t == TEXT && !(it->p0 < nt && it->np < nt - it->p0 && !txt[it->p0 + it->np])) return 0;
+    if (t == TABLE) {
+        if (it->cols < 1 || it->cols > MAX_COLS || it->np < it->cols || it->np % it->cols || it->np / it->cols > MAX_ROWS) return 0;
+        for (int k = 0; k < it->np; k++) { const char *e = at < nt ? memchr(txt + at, 0, nt - at) : NULL; if (!e) return 0; at = e - txt + 1; }
+    } else if (it->cols) return 0;
+    return it->from >= 0 && it->from <= n && it->to >= 0 && it->to <= n && it->from != i + 1 && it->to != i + 1
+        && (connector(t) || (!it->from && !it->to)) && it->parent >= 0 && it->parent <= n && it->parent != i + 1
+        && (!it->id || str_at(txt, nt, it->id, 64)) && (!it->label || (labelled(t) && str_at(txt, nt, it->label, 65536)))
+        && (!it->caption || (fillable(t) && str_at(txt, nt, it->caption, 65536)))
+        && !(it->style & ~(DASHED | ELBOW)) && (connector(t) || !(it->style & ELBOW))
+        && (!it->label_size || (it->label_size >= 1 && it->label_size <= 64)) && it->wrap >= 0 && it->wrap <= 1e6 && (t == TEXT || !it->wrap);
+}
+/* keep: a reload, appended to the pools as one undo step. 0 ok (a missing file is an empty board, unless keep),
+   -1 corrupt, -2 open error. The board changes only after the whole file checks out. */
+static int load(int keep) {
+    FILE *f = fopen(path, "rb"); char magic[4] = {0}; int n = 0, np = 0, nt = 0, v = 0;
+    if (!f) { if (errno == ENOENT && !keep) return 0; perror(path); return -2; }
+    if (fread(magic, 4, 1, f) == 1 && !memcmp(magic, "PB0", 3) && magic[3] >= '2' && magic[3] <= '5') v = magic[3] - '0';
+    size_t size = v == 2 ? sizeof(ItemV2) : v == 3 ? sizeof(ItemV3) : v == 4 ? sizeof(ItemV4) : sizeof(Item);
+    int ok = v && fread(&n, 4, 1, f) == 1 && fread(&np, 4, 1, f) == 1 && fread(&nt, 4, 1, f) == 1
              && n >= 0 && n < 1 << 20 && np >= 0 && np < 1 << 26 && nt >= 0 && nt < 1 << 26;
-    if (ok) {
-        items = grow(items, &capitems, n + 1, sizeof *items);
-        pool = grow(pool, &cappool, np + 2, sizeof *pool);
-        tpool = grow(tpool, &captpool, nt + 2, 1);
-        if (v2) {
-            ItemV2 *o = malloc((n + 1) * sizeof *o);
-            ok = fread(o, sizeof *o, n, f) == (size_t)n;
-            for (int i = 0; ok && i < n; i++)
-                items[i] = (Item){ .type = o[i].type, .color = o[i].color, .fill = -1, .x0 = o[i].x0, .y0 = o[i].y0,
-                                   .x1 = o[i].x1, .y1 = o[i].y1, .width = o[i].width, .sx = 1, .sy = 1, .p0 = o[i].p0, .np = o[i].np };
-            free(o);
-        } else if (v3) {
-            ItemV3 *o = malloc((n + 1) * sizeof *o);
-            ok = fread(o, sizeof *o, n, f) == (size_t)n;
-            for (int i = 0; ok && i < n; i++) { items[i] = (Item){0}; memcpy(&items[i], &o[i], sizeof *o); } /* same leading fields */
-            free(o);
-        } else ok = fread(items, sizeof(Item), n, f) == (size_t)n;
-        ok = ok && fread(pool, sizeof(float), np, f) == (size_t)np && fread(tpool, 1, nt, f) == (size_t)nt;
-    }
+    Item *in = ok ? calloc(n + 1, sizeof *in) : NULL; char *raw = ok ? malloc((n + 1) * size) : NULL, *txt = ok ? malloc(nt + 1) : NULL;
+    float *pts = ok ? malloc((np + 1) * sizeof *pts) : NULL; int *parent = ok ? malloc((n + 1) * sizeof *parent) : NULL;
+    struct stat st;
+    ok = ok && in && raw && txt && pts && parent && fread(raw, size, n, f) == (size_t)n && fread(pts, sizeof *pts, np, f) == (size_t)np
+         && fread(txt, 1, nt, f) == (size_t)nt && !fstat(fileno(f), &st);
     fclose(f);
-    for (int i = 0; ok && i < nt; i++) ok = !tpool[i] || tpool[i] == '\n' || (unsigned char)tpool[i] >= 32;
     for (int i = 0; ok && i < n; i++) {
-        Item *it = &items[i]; it->sel = 0;
-        ok = it->type >= 0 && it->type < SELECT && it->color >= 0 && it->color < NCOLORS && it->fill >= -1 && it->fill < NCOLORS
-             && it->width >= 1 && it->width <= 64 && isfinite(it->x0) && isfinite(it->y0) && isfinite(it->x1) && isfinite(it->y1)
-             && isfinite(it->sx) && isfinite(it->sy) && it->p0 >= 0 && it->np >= 0
-             && (is_pen(it->type) ? it->p0 <= np && it->np <= (np - it->p0) / 2
-               : it->type == TEXT ? it->p0 < nt && it->np < nt - it->p0 && !tpool[it->p0 + it->np] : 1)
-             && it->from >= 0 && it->from <= n && it->to >= 0 && it->to <= n && it->from != i + 1 && it->to != i + 1
-             && (connector(it->type) || (!it->from && !it->to));
+        if (v == 2) {
+            ItemV2 *o = (ItemV2 *)raw + i;
+            in[i] = (Item){ .type = o->type, .color = o->color, .fill = -1, .x0 = o->x0, .y0 = o->y0,
+                            .x1 = o->x1, .y1 = o->y1, .width = o->width, .sx = 1, .sy = 1, .p0 = o->p0, .np = o->np };
+        } else memcpy(&in[i], raw + i * size, size); /* later layouts only append fields */
+        in[i].sel = 0;
     }
-    if (!ok) return -1;
-    nitems = n; npool = np; ntpool = nt;
-    for (int i = 0; i < n; i++) if (items[i].type == TEXT) measure(&items[i]); /* font metrics may differ from the saving build */
-    relink();
+    for (int i = 0; ok && i < nt; i++) ok = !txt[i] || txt[i] == '\n' || (unsigned char)txt[i] >= 32;
+    for (int i = 0; ok && i < n; i++) { ok = item_ok(&in[i], i, n, np, nt, txt); parent[i] = in[i].parent; }
+    for (int i = 0; ok && i < n; i++) ok = depth(parent, i) <= MAX_DEPTH;
+    free(raw); free(parent);
+    if (!ok) { free(in); free(txt); free(pts); return -1; }
+    if (keep) checkpoint();
+    int bp = keep ? npool : 0, bt = keep ? ntpool : 0;
+    items = grow(items, &capitems, n + 1, sizeof *items);
+    pool = grow(pool, &cappool, bp + np + 2, sizeof *pool); tpool = grow(tpool, &captpool, bt + nt + 2, 1);
+    memcpy(pool + bp, pts, np * sizeof *pts); memcpy(tpool + bt, txt, nt);
+    for (int i = 0; i < n; i++) {
+        Item *it = &in[i];
+        if (has_points(it) && it->np) it->p0 += bp; else if (it->type == TEXT || it->type == TABLE) it->p0 += bt;
+        if (it->id) it->id += bt;
+        if (it->label) it->label += bt;
+        if (it->caption) it->caption += bt;
+    }
+    memcpy(items, in, n * sizeof *in); nitems = n; npool = bp + np; ntpool = bt + nt;
+    free(in); free(txt); free(pts);
+    for (int i = 0; i < n; i++) if (items[i].type == TEXT || items[i].type == TABLE) measure(&items[i]); /* font metrics may differ from the saving build */
+    relink(); disk = stamp_of(&st); dirty = 0;
     return 0;
 }
 static char *export_path(const char *board, const char *type) { /* type is ".png" or ".svg" */
@@ -800,11 +1153,32 @@ static int write_fitted(FILE *f) { /* 1 ok */
 
 /* ---- SVG: the whole board as vectors; needs no OpenGL ---- */
 static void svg_points(FILE *f, const float *xy, int n) { for (int i = 0; i < n; i++) fprintf(f, "%s%.1f,%.1f", i ? " " : "", xy[2 * i], xy[2 * i + 1]); }
+static void svg_text(FILE *f, float x, float y, const char *s, int middle) { /* y is the baseline */
+    fprintf(f, "<text x=\"%.1f\" y=\"%.1f\"%s>", x, y, middle ? " text-anchor=\"middle\"" : "");
+    for (; *s; s++) if (*s == '&') fputs("&amp;", f); else if (*s == '<') fputs("&lt;", f); else if (*s == '>') fputs("&gt;", f); else fputc(*s, f);
+    fputs("</text>", f);
+}
+static void svg_table(FILE *f, const Item *it) {
+    float h[MAX_ROWS], l = fminf(it->x0, it->x1), r = fmaxf(it->x0, it->x1), cw = (r - l) / it->cols, y = it->y0, px = lsize(it) * 7;
+    int rows = table_rows(it, h);
+    if (it->fill >= 0) fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" fill=\"#%06x\"/>\n", l, y, r - l, h[0], FILLC[it->fill]);
+    fprintf(f, "<g font-size=\"%.2f\" fill=\"#%06x\">", px * canvas_font.em, STROKE[0]);
+    const char *s = tpool + it->p0;
+    for (int row = 0; row < rows; y += h[row++])
+        for (int c = 0; c < it->cols; c++, s += strlen(s) + 1) text_lines(s, l + c * cw + 8, y + 8, px, cw - 16, 0, 0, f);
+    fprintf(f, "</g>\n<g fill=\"none\" stroke=\"#%06x\" stroke-width=\"%g\" stroke-linecap=\"round\">", STROKE[it->color], it->width);
+    fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\"/>", l, it->y0, r - l, it->y1 - it->y0);
+    y = it->y0;
+    for (int row = 0; row + 1 < rows; row++) { y += h[row]; fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke-width=\"%g\"/>", l, y, r, y, it->width * .6f); }
+    for (int c = 1; c < it->cols; c++)
+        fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke-width=\"%g\"/>", l + c * cw, it->y0, l + c * cw, it->y1, it->width * .6f);
+    fputs("</g>\n", f);
+}
 static int write_svg(FILE *f) { /* 1 ok */
     float b[4], buf[128]; board_bounds(b); int text = 0;
     fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.0f\" height=\"%.0f\" viewBox=\"%.1f %.1f %.1f %.1f\">\n",
             ceilf(b[2] - b[0]), ceilf(b[3] - b[1]), b[0], b[1], b[2] - b[0], b[3] - b[1]);
-    for (int i = 0; i < nitems; i++) text |= items[i].type == TEXT;
+    for (int i = 0; i < nitems; i++) text |= items[i].type == TEXT || items[i].type == TABLE || items[i].label;
     if (text) { /* embed the canvas font so text keeps its look and width */
         static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         fputs("<style>@font-face{font-family:Excalifont;src:url(data:font/ttf;base64,", f);
@@ -815,21 +1189,18 @@ static int write_svg(FILE *f) { /* 1 ok */
         fputs(")}text{font-family:Excalifont,sans-serif;white-space:pre}</style>\n", f);
     }
     fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" fill=\"#ffffff\"/>\n", b[0], b[1], b[2] - b[0], b[3] - b[1]);
+    mark_containers();
     for (int i = 0; i < nitems; i++) {
         const Item *it = &items[i]; unsigned c = STROKE[it->color];
         if (it->type == TEXT) { /* one element per line, so blank lines keep their height */
-            float px = tpx(it), y = it->y0 + px * canvas_font.ascent;
-            fprintf(f, "<g font-size=\"%.2f\" fill=\"#%06x\">", px * canvas_font.em, c);
-            for (const char *s = tpool + it->p0; ; s++, y += px * 1.25f) {
-                fprintf(f, "<text x=\"%.1f\" y=\"%.1f\">", it->x0, y);
-                for (; *s && *s != '\n'; s++)
-                    if (*s == '&') fputs("&amp;", f); else if (*s == '<') fputs("&lt;", f); else if (*s == '>') fputs("&gt;", f); else fputc(*s, f);
-                fputs("</text>", f);
-                if (!*s) break;
-            }
+            fprintf(f, "<g font-size=\"%.2f\" fill=\"#%06x\">", tpx(it) * canvas_font.em, c);
+            text_lines(tpool + it->p0, it->x0, it->y0, tpx(it), it->wrap, 0, 0, f);
             fputs("</g>\n", f);
             continue;
         }
+        if (it->type == TABLE) { svg_table(f, it); continue; }
+        char dashattr[48] = "";
+        if (it->style & DASHED) snprintf(dashattr, sizeof dashattr, " stroke-dasharray=\"%g %g\"", dash_len(it), dash_len(it) + it->width);
         fprintf(f, "<g fill=\"none\" stroke=\"#%06x\" stroke-width=\"%g\" stroke-linecap=\"round\" stroke-linejoin=\"round\"%s>",
                 c, it->width, it->type == HIGHLIGHT ? " opacity=\".35\"" : "");
         switch (it->type) {
@@ -839,25 +1210,29 @@ static int write_svg(FILE *f) { /* 1 ok */
             for (int k = 0; k < it->np; k++) { float x, y; pen_pt(it, k, &x, &y); fprintf(f, "%s%.1f,%.1f", k ? " " : "", x, y); }
             fputs("\"/>", f);
             break;
-        case LINE: case ARROW:
-            fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\"/>", it->x0, it->y0, it->x1, it->y1);
-            if (it->type == ARROW) { /* the same head as draw_item */
-                float a = atan2f(it->y1 - it->y0, it->x1 - it->x0), h = fmaxf(12, it->width * 4);
-                float head[6] = { it->x1 - h * cosf(a - .5f), it->y1 - h * sinf(a - .5f), it->x1, it->y1,
-                                  it->x1 - h * cosf(a + .5f), it->y1 - h * sinf(a + .5f) };
-                fputs("<polyline points=\"", f); svg_points(f, head, 3); fputs("\"/>", f);
+        case LINE: case ARROW: {
+            int n = conn_route(it); float head[6], lb[4], cx, top;
+            fputs("<polyline points=\"", f); svg_points(f, route, n); fprintf(f, "\"%s/>", dashattr);
+            if (it->type == ARROW) { arrow_head(it, n, head); fputs("<polyline points=\"", f); svg_points(f, head, 3); fputs("\"/>", f); }
+            if (conn_label(it, lb, &cx, &top)) {
+                fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"4\" fill=\"#ffffff\" stroke=\"none\"/>",
+                        lb[0], lb[1], lb[2] - lb[0], lb[3] - lb[1]);
+                fprintf(f, "<g font-size=\"%.2f\" fill=\"#%06x\" stroke=\"none\">", lsize(it) * 7 * canvas_font.em, c);
+                text_lines(tstr(it->label), cx, top, lsize(it) * 7, 0, 1, 0, f); fputs("</g>", f);
             }
             break;
+        }
         default: {
             char fillattr[24] = "";
             if (it->fill >= 0) snprintf(fillattr, sizeof fillattr, " fill=\"#%06x\"", FILLC[it->fill]);
             if (it->type == ELLIPSE)
-                fprintf(f, "<ellipse cx=\"%.1f\" cy=\"%.1f\" rx=\"%.1f\" ry=\"%.1f\"%s/>", (it->x0 + it->x1) / 2, (it->y0 + it->y1) / 2,
-                        fabsf(it->x1 - it->x0) / 2, fabsf(it->y1 - it->y0) / 2, fillattr);
-            else { fputs("<polygon points=\"", f); svg_points(f, buf, poly(it, buf)); fprintf(f, "\"%s/>", fillattr); }
+                fprintf(f, "<ellipse cx=\"%.1f\" cy=\"%.1f\" rx=\"%.1f\" ry=\"%.1f\"%s%s/>", (it->x0 + it->x1) / 2, (it->y0 + it->y1) / 2,
+                        fabsf(it->x1 - it->x0) / 2, fabsf(it->y1 - it->y0) / 2, fillattr, dashattr);
+            else { fputs("<polygon points=\"", f); svg_points(f, buf, poly(it, buf)); fprintf(f, "\"%s%s/>", fillattr, dashattr); }
         }
         }
         fputs("</g>\n", f);
+        if (fillable(it->type)) shape_text(it, haskids[i], f);
     }
     return fputs("</svg>\n", f) >= 0 && fflush(f) == 0;
 }
@@ -874,10 +1249,10 @@ static int export_svg(void) {
 /* ---- tabs: the active board lives in the globals; docs[cur] is stale until doc_park ---- */
 typedef struct {
     float *pool; int npool, cappool; char *tpool; int ntpool, captpool; Item *items; int nitems, capitems;
-    Snap undo[MAX_UNDO], redo[MAX_UNDO]; int nundo, nredo; char *path; float panx, pany, zoom; int dirty;
+    Snap undo[MAX_UNDO], redo[MAX_UNDO]; int nundo, nredo; char *path; float panx, pany, zoom; int dirty; Stamp disk;
 } Doc;
 #define DOC_FIELDS X(pool) X(npool) X(cappool) X(tpool) X(ntpool) X(captpool) X(items) X(nitems) X(capitems) \
-                   X(nundo) X(nredo) X(path) X(panx) X(pany) X(zoom) X(dirty)
+                   X(nundo) X(nredo) X(path) X(panx) X(pany) X(zoom) X(dirty) X(disk)
 static Doc *docs; static int ndocs, capdocs, cur;
 static void doc_park(void) {
 #define X(f) docs[cur].f = f;
@@ -892,6 +1267,7 @@ static void doc_enter(int i) {
 #undef X
     memcpy(undo, docs[i].undo, sizeof undo); memcpy(redo, docs[i].redo, sizeof redo);
     revision++; /* a reply computed for the previous tab now fails its revision check */
+    disk_check = 1;
 }
 static void doc_leave(void) { end_edit(); drag = NONE; panning = 0; doc_park(); } /* nothing may point into the board */
 static void doc_add(char *owned_path) { /* a new empty tab, made active */
@@ -935,20 +1311,36 @@ static int open_path(const char *file) { /* absolute path; switches to its tab w
     if (i >= 0) { doc_switch(i); return 0; }
     int reuse = !path && !nitems && !nundo && !nredo; /* an untouched Untitled tab takes the file */
     if (reuse) { end_edit(); path = strdup(file); } else doc_add(strdup(file));
-    int r = load();
+    int r = load(0);
     if (!r) { dirty = 0; return 0; }
     if (r == -1) notify("%s: not a paintboard file", file); else notify("Cannot open %s: %s", file, strerror(errno));
     if (reuse) { free(path); path = NULL; } else { doc_remove(cur); doc_switch(prev); }
     return -1;
 }
-static int save_now(void) { /* 0 ok */
-    if (!save()) return 0;
-    notify("Cannot save %s: %s", path, strerror(errno)); return -1;
+static int save_now(void) { /* 0 ok; a file changed on disk asks the human first */
+    int r = save(0);
+    if (!r) return 0;
+    if (r == -3) disk_open(); else notify("Cannot save %s: %s", path, strerror(errno));
+    return -1;
 }
 static int save_named_tabs(void) { /* an MCP session ends without questions; 0 when every save worked */
     int failed = 0;
-    for (int i = 0; i < ndocs; i++) { doc_switch(i); end_edit(); if (path && save_now()) failed = 1; }
+    for (int i = 0; i < ndocs; i++) {
+        doc_switch(i); end_edit();
+        if (!path || !dirty) continue;
+        int r = save(0);
+        if (r == -3) notify("%s changed on disk, so this session did not overwrite it", path);
+        failed |= r != 0;
+    }
     return failed;
+}
+static int reload(void) { /* the file into the active tab as one undo step; 0 ok */
+    end_edit(); drag = NONE;
+    int r = load(1);
+    if (r == -1) notify("%s: not a paintboard file", path);
+    else if (r) notify("Cannot reload %s: %s", path, strerror(errno));
+    else notify("Reloaded %s from disk; Undo brings back the previous version", base_name(path));
+    return r;
 }
 
 /* Closing a tab or the window: a board with unsaved changes asks first. */
@@ -1027,23 +1419,31 @@ static void session_restore(void) {
 
 /* ---- panel: immediate-mode; the same walk draws (ui_mode 0) or hit-tests a click (ui_mode 1) ---- */
 static int inside(float x, float y, float w, float h, float px, float py) { return px >= x && px < x + w && py >= y && py < y + h; }
+static int ui_off; /* the next widgets draw greyed out and take no clicks */
+static unsigned faded(unsigned c) { /* c when live, else 30% of it over the panel background; opaque, so overlaps stay even */
+    unsigned r = 0;
+    for (int s = 0; s < 24; s += 8) r |= (unsigned)(ui_off ? .3f * (c >> s & 255) + .7f * (0xf8f9fa >> s & 255) : c >> s & 255) << s;
+    return r;
+}
 static int button(float x, float y, float w, float h, const char *name, const char *key, int active) {
-    int hover = inside(x, y, w, h, ui_x, ui_y);
+    int hover = inside(x, y, w, h, ui_x, ui_y) && !ui_off;
+    active &= !ui_off;
     if (ui_mode) return hover;
     ui_hover |= hover;
     hex(active ? ACCENT : 0xdee2e6); rrect(x - 1, y - 1, w + 2, h + 2, 7);
     hex(active ? 0xe0dfff : hover ? 0xf1f3f5 : 0xffffff); rrect(x, y, w, h, 6);
     float tx = key ? x + 12 : x + (w - text_w(&ui_font, 13, name)) / 2;
-    text_draw(&ui_font, tx, y + (h - 13 * 1.25f) / 2, 13, INK, name);
+    text_draw(&ui_font, tx, y + (h - 13 * 1.25f) / 2, 13, ui_off ? 0xced4da : INK, name);
     if (key) text_draw(&ui_font, x + w - 10 - text_w(&ui_font, 11, key), y + (h - 11 * 1.25f) / 2, 11, MUTED, key);
     return 0;
 }
 static int swatch(float x, float y, unsigned col, int active) {
-    if (ui_mode) return inside(x, y, 24, 24, ui_x, ui_y);
-    ui_hover |= inside(x, y, 24, 24, ui_x, ui_y);
-    if (active) { hex(ACCENT); rrect(x - 4, y - 4, 32, 32, 9); hex(0xf8f9fa); rrect(x - 2, y - 2, 28, 28, 8); }
-    else { hex(0xdee2e6); rrect(x - 1, y - 1, 26, 26, 7); }
-    hex(col); rrect(x, y, 24, 24, 6);
+    int hover = inside(x, y, 24, 24, ui_x, ui_y) && !ui_off;
+    if (ui_mode) return hover;
+    ui_hover |= hover;
+    if (active) { hex(faded(ACCENT)); rrect(x - 4, y - 4, 32, 32, 9); hex(0xf8f9fa); rrect(x - 2, y - 2, 28, 28, 8); }
+    else { hex(faded(0xdee2e6)); rrect(x - 1, y - 1, 26, 26, 7); }
+    hex(faded(col)); rrect(x, y, 24, 24, 6);
     return 0;
 }
 static void section(float y, const char *s) { if (!ui_mode) text_draw(&ui_font, 12, y, 10, MUTED, s); }
@@ -1198,8 +1598,8 @@ static void fd_confirm(void) {
     int other = find_tab(target);
     if (other >= 0 && other != cur) { strcpy(fd_error, "That file is open in another tab"); return; }
     if (exists && other != cur && !fd_replace) { fd_replace = 1; return; }
-    char *old = path; path = strdup(target);
-    if (save()) { snprintf(fd_error, sizeof fd_error, "Cannot save: %s", strerror(errno)); free(path); path = old; return; }
+    char *old = path; Stamp was = disk; path = strdup(target); disk = (Stamp){0}; /* the stamp belonged to the old file */
+    if (save(0)) { snprintf(fd_error, sizeof fd_error, "Cannot save: %s", strerror(errno)); free(path); path = old; disk = was; return; }
     free(old); snprintf(last_dir, sizeof last_dir, "%s", fd_dir); notify("Saved %s", base_name(path));
     int go = fd_then_proceed; fd_then_proceed = 0; fd_mode = 0;
     if (go) proceed();
@@ -1291,6 +1691,33 @@ static void ask_ui(void) {
     if (button(x + w - 124, y + 118, 104, 32, path ? "Save" : "Save...", NULL, 1)) ask_answer(2);
 }
 
+/* ---- the active tab's file changed on disk: Keep mine / Overwrite / Reload ---- */
+static int disk_asking;
+static void disk_open(void) { if (win) { end_edit(); drag = NONE; disk_asking = 1; } }
+static void disk_answer(int answer) { /* 0 keep mine, 1 reload, 2 overwrite */
+    struct stat st; disk_asking = 0;
+    if (answer == 1) { reload(); return; }
+    if (!stat(path, &st)) disk = stamp_of(&st); /* the human saw this version, so the next save may replace it */
+    if (answer == 2 && !save_now()) notify("Saved %s", base_name(path));
+}
+static void disk_ui(void) {
+    float x, y, w; dialog_box(170, &x, &y, &w); char title[300];
+    if (!ui_mode) {
+        snprintf(title, sizeof title, "%s changed on disk", base_name(path)); fit(title, 20, w - 40);
+        text_draw(&ui_font, x + 20, y + 16, 20, INK, title);
+        text_draw(&ui_font, x + 20, y + 56, 13, MUTED, "Another program saved this board. Reload shows its version,\nand Undo brings yours back. Keep mine leaves the file alone.");
+    }
+    if (button(x + 20, y + 118, 110, 32, "Keep mine", NULL, 0)) { disk_answer(0); return; }
+    if (button(x + w - 232, y + 118, 100, 32, "Overwrite", NULL, 0)) { disk_answer(2); return; }
+    if (button(x + w - 124, y + 118, 104, 32, "Reload", NULL, 1)) disk_answer(1);
+}
+static void disk_poll(void) { /* on focus and tab switch: reload a clean tab, ask about one with changes */
+    if (!disk_check || custom_dialog || fd_mode || asking || disk_asking || permit_shown || editing >= 0 || drag != NONE || panning) return;
+    disk_check = 0;
+    if (!on_disk_changed()) return;
+    if (dirty) disk_open(); else reload();
+}
+
 /* ---- tab bar: a strip over the top of the canvas, the same draw / hit-test walk as the panel ---- */
 #define TAB_H 32
 static int ui_middle; /* the hit-test click is a middle click */
@@ -1319,6 +1746,17 @@ static void tabs_ui(int ww) {
     if (button(x0 + 6 + ndocs * tw, 5, 26, 22, "+", NULL, 0)) doc_add(NULL);
 }
 
+static int any_type(int t) { return 1; }
+static int takes_fill(int t) { return fillable(t) || t == TABLE; }
+static int takes_dash(int t) { return styled(t, DASHED); }
+static int takes_elbow(int t) { return styled(t, ELBOW); }
+static int takes_snap(int t) { return !is_pen(t); }
+static int live(int (*takes)(int)) { /* the current tool draws such an item, or the edit or the selection holds one */
+    if (tool < SELECT && takes(tool)) return 1;
+    if (editing >= 0 && takes(items[editing].type)) return 1;
+    for (int i = 0; i < nitems; i++) if (items[i].sel && takes(items[i].type)) return 1;
+    return 0;
+}
 static void ui(void) {
     float y = 12, vis = winh / ui_s; char buf[24];
     panel_scroll = fminf(fmaxf(panel_scroll, 0), fmaxf(0, panel_h - vis));
@@ -1327,37 +1765,47 @@ static void ui(void) {
         glPushMatrix(); glTranslatef(0, -panel_scroll, 0);
         hex(0xf8f9fa); fill(0, panel_scroll, PANEL_W, vis); hex(0xe9ecef); fill(PANEL_W - 1, panel_scroll, 1, vis);
     }
-    static const int order[NTOOLS] = { SELECT, ERASER, PEN, HIGHLIGHT, LINE, ARROW, RECT, ELLIPSE, DIAMOND, TRIANGLE, STAR, TEXT };
-    for (int k = 0; k < NTOOLS; k++) if (button(8 + k % 2 * 80, y + k / 2 * 32, 72, 28, TOOL_NAME[order[k]], NULL, tool == order[k])) set_tool(order[k]);
-    y += (NTOOLS + 1) / 2 * 32 + 4; section(y, "STROKE"); y += 18;
+    static const int order[] = { SELECT, ERASER, PEN, HIGHLIGHT, LINE, ARROW, RECT, ELLIPSE, DIAMOND, TRIANGLE, STAR, TEXT }; /* tables come from agents */
+    enum { NORDER = sizeof order / sizeof *order };
+    for (int k = 0; k < NORDER; k++) if (button(8 + k % 2 * 80, y + k / 2 * 32, 72, 28, TOOL_NAME[order[k]], NULL, tool == order[k])) set_tool(order[k]);
+    y += (NORDER + 1) / 2 * 32 + 4; section(y, "STROKE"); y += 18;
+    ui_off = !live(any_type); /* a control is live only when it changes the current tool's next item or the selection */
     for (int c = 0; c < NCOLORS; c++) if (swatch(24 + c % 4 * 32, y + c / 4 * 32, STROKE[c], c == color)) set_color(c);
+    ui_off = !live(takes_fill);
     y += 70; section(y, "FILL"); y += 18;
     if (swatch(8, y, 0xffffff, fillc < 0)) set_fill(-1);
-    if (!ui_mode) { hex(0xe03131); seg(14, y + 18, 26, y + 6, 2); }
+    if (!ui_mode) { hex(faded(0xe03131)); seg(14, y + 18, 26, y + 6, 2); }
     for (int c = 0; c < NCOLORS; c++) if (swatch(8 + (c + 1) % 5 * 32, y + (c + 1) / 5 * 32, FILLC[c], c == fillc)) set_fill(c);
     static const float PRESET[3][4] = { { 2, 3, 5, 8 }, { 1, 3, 6, 12 }, { 8, 16, 24, 32 } }; /* text, stroke, marker */
     static const char *PRESET_NAME[4] = { "S", "M", "L", "XL" };
     int kind = width_kind(); float shown = shown_width();
     y += 70; section(y, kind == TEXT ? "TEXT SIZE" : kind == HIGHLIGHT ? "MARKER WIDTH" : "STROKE WIDTH"); y += 18;
+    ui_off = !live(any_type);
     if (button(8, y, 28, 28, "-", NULL, 0)) set_width(shown - 1);
     if (!ui_mode) {
         if (kind == TEXT) {
             float px = fminf(shown * 7, 26);
-            text_draw(&canvas_font, 66 - text_w(&canvas_font, px, "Aa") / 2, y + 14 - px * .6f, px, STROKE[color], "Aa");
+            text_draw(&canvas_font, 66 - text_w(&canvas_font, px, "Aa") / 2, y + 14 - px * .6f, px, ui_off ? 0xced4da : STROKE[color], "Aa");
             snprintf(buf, sizeof buf, "%gpx", shown * 7);
         } else {
-            if (kind == HIGHLIGHT) hexa(STROKE[color], .35f); else hex(STROKE[color]);
+            hexa(STROKE[color], (kind == HIGHLIGHT ? .35f : 1) * (ui_off ? .3f : 1));
             seg(46, y + 14, 86, y + 14, fminf(shown, 24));
             snprintf(buf, sizeof buf, "%g", shown);
         }
-        text_draw(&ui_font, 108 - text_w(&ui_font, 12, buf) / 2, y + 6, 12, INK, buf);
+        text_draw(&ui_font, 108 - text_w(&ui_font, 12, buf) / 2, y + 6, 12, ui_off ? 0xced4da : INK, buf);
     }
     if (button(132, y, 28, 28, "+", NULL, 0)) set_width(shown + 1);
     y += 32;
     const float *preset = PRESET[kind == TEXT ? 0 : kind == HIGHLIGHT ? 2 : 1];
     for (int k = 0; k < 4; k++) if (button(8 + k * 39, y, 35, 26, PRESET_NAME[k], NULL, shown == preset[k])) set_width(preset[k]);
     y += 34;
-    if (button(8, y, 152, 28, "Snap to grid", "G", snap)) snap ^= 1;
+    ui_off = !live(takes_snap) && tool != SELECT; /* a move snaps whatever it moves */
+    if (button(8, y, 48, 28, "Snap", NULL, snap)) snap ^= 1; /* one row, so the panel keeps its height */
+    ui_off = !live(takes_dash);
+    if (button(60, y, 48, 28, "Dash", NULL, shown_style(DASHED))) toggle_style(DASHED);
+    ui_off = !live(takes_elbow);
+    if (button(112, y, 48, 28, "Elbow", NULL, shown_style(ELBOW))) toggle_style(ELBOW);
+    ui_off = 0;
     y += 36;
     if (button(8, y, 72, 28, "Undo", NULL, 0)) do_undo();
     if (button(88, y, 72, 28, "Redo", NULL, 0)) do_redo();
@@ -1401,11 +1849,12 @@ static void hint_bar(int ww) { /* one-line context help along the bottom of the 
     static const char *tool_hint[NTOOLS] = {
         "Drag to draw", "Drag to draw a line", "Drag to draw an arrow", "Drag to draw a rectangle", "Drag to draw an ellipse",
         "Click to type, click text to edit it (or double-click it with Select)", "Drag to draw a diamond", "Drag to draw a triangle", "Drag to draw a star",
-        "Drag to highlight", "Click or drag a box to select", "Drag over items to erase  ·  Ctrl+Shift+Del resets the board" };
+        "Drag to highlight", "", "Click or drag a box to select  ·  double-click a shape or arrow to label it",
+        "Drag over items to erase  ·  Ctrl+Shift+Del resets the board" };
     char s[200]; int n = nsel();
     if (*notice && glfwGetTime() < notice_until) snprintf(s, sizeof s, "%s", notice);
     else if (editing >= 0) snprintf(s, sizeof s, "Enter newline  ·  Esc done  ·  arrows, Home, End move  ·  [ ] text size  ·  Ctrl+V paste");
-    else if (tool == SELECT && n) snprintf(s, sizeof s, "%d selected  ·  drag to move, corners resize  ·  Del  ·  Ctrl+D duplicate", n);
+    else if (tool == SELECT && n) snprintf(s, sizeof s, "%d selected  ·  drag to move, corners resize  ·  Del  ·  Ctrl+D duplicate  ·  Ctrl+G frame", n);
     else snprintf(s, sizeof s, "%s (%s)%s  ·  right drag pan  ·  wheel zoom", tool_hint[tool], TOOL_KEY[tool], snap ? "  ·  grid snap on" : "");
     float x = PANEL_W + 12, y = winh / ui_s - 30;
     fit(s, 11, ww / ui_s - x - 20);
@@ -1416,6 +1865,28 @@ static void hint_bar(int ww) { /* one-line context help along the bottom of the 
 }
 
 /* ---- input ---- */
+static int contains(const float *outer, const float *b) { return outer[0] <= b[0] && outer[1] <= b[1] && outer[2] >= b[2] && outer[3] >= b[3]; }
+static int nesting_ok(void) { /* every chain of containers ends within MAX_DEPTH */
+    int *parent = malloc((nitems + 1) * sizeof *parent), ok = 1;
+    for (int i = 0; i < nitems; i++) parent[i] = items[i].parent;
+    for (int i = 0; ok && i < nitems; i++) ok = depth(parent, i) <= MAX_DEPTH;
+    free(parent); return ok;
+}
+static void regroup(void) { /* a dragged item leaves a container it no longer sits in, and joins one it lands in */
+    mark_containers();
+    for (int i = 0; i < nitems; i++) {
+        if (!items[i].sel) continue;
+        float b[4], c[4]; int p = items[i].parent - 1; bbox(&items[i], b);
+        if (p >= 0 && !items[p].sel) { bbox(&items[p], c); if (!contains(c, b)) items[i].parent = 0; }
+        for (int j = nitems - 1; j >= 0 && !items[i].parent; j--) { /* the topmost container that holds it */
+            if (j == i || !haskids[j] || items[j].sel) continue;
+            bbox(&items[j], c);
+            int k = j; while (k >= 0 && k != i) k = items[k].parent - 1; /* j must not sit inside i */
+            if (k < 0 && contains(c, b)) { items[i].parent = j + 1; if (!nesting_ok()) items[i].parent = 0; }
+        }
+    }
+}
+static void on_focus(GLFWwindow *w, int focused) { if (focused) disk_check = 1; } /* ponytail: no file watcher; inotify if live reload matters */
 static void on_button(GLFWwindow *w, int button, int action, int mods) {
     double sx, sy; glfwGetCursorPos(w, &sx, &sy);
     if (custom_dialog) {
@@ -1424,10 +1895,10 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
         }
         return;
     }
-    if (asking || fd_mode) {
-        if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+    if (asking || fd_mode || disk_asking || permit_shown) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) { /* the topmost dialog takes the click */
             ui_mode = 1; ui_x = sx / ui_s; ui_y = sy / ui_s;
-            if (asking) ask_ui(); else fd_ui();
+            if (permit_shown) permit_ui(); else if (disk_asking) disk_ui(); else if (asking) ask_ui(); else fd_ui();
             ui_mode = 0;
         }
         return;
@@ -1464,10 +1935,11 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
                 if (b[0] >= m[0] && b[1] >= m[1] && b[2] <= m[2] && b[3] <= m[3]) items[i].sel = 1;
             }
         }
+        if (drag == MOVE && base) regroup();
         drag = NONE;
         return;
     }
-    int edited = editing >= 0 && items[editing].np ? editing : -1;
+    int edited = editing >= 0 && *edit_n() ? editing : -1;
     end_edit();
     if (sx < panel_w()) {
         if (edited >= 0) { select_none(); items[edited].sel = 1; } /* panel styles then apply to the text just typed */
@@ -1479,6 +1951,7 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
         int h = hit(wx, wy), twice = h >= 0 && h == last_hit && glfwGetTime() - last_click < .4;
         last_hit = h; last_click = glfwGetTime();
         if (twice && !shift && items[h].type == TEXT) { select_none(); checkpoint(); start_edit(h); last_hit = -1; return; }
+        if (twice && !shift && labelled(items[h].type)) { select_none(); checkpoint(); start_label_edit(h); last_hit = -1; return; }
         if (sel_frame(b)) {
             float cx[4] = { b[0], b[2], b[2], b[0] }, cy[4] = { b[1], b[1], b[3], b[3] };
             for (int k = 0; k < 4; k++) {
@@ -1505,6 +1978,7 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
     if (!is_pen(tool)) { wx = snapf(wx); wy = snapf(wy); }
     checkpoint();
     Item it = { .type = tool, .color = color, .fill = fillable(tool) ? fillc : -1, .x0 = wx, .y0 = wy, .x1 = wx, .y1 = wy,
+                .style = tool_style & ((styled(tool, DASHED) ? DASHED : 0) | (styled(tool, ELBOW) ? ELBOW : 0)),
                 .width = width, .sx = 1, .sy = 1, .p0 = tool == TEXT ? ntpool : npool };
     if (tool == TEXT) {
         if (h >= 0 && items[h].type == TEXT) start_edit(h);
@@ -1517,7 +1991,7 @@ static void on_button(GLFWwindow *w, int button, int action, int mods) {
 }
 static void on_cursor(GLFWwindow *w, double sx, double sy) {
     float dx = sx - lastx, dy = sy - lasty; lastx = sx; lasty = sy;
-    if (custom_dialog || fd_mode || asking) return;
+    if (custom_dialog || fd_mode || asking || disk_asking || permit_shown) return;
     float wx = (sx - panx) / zoom, wy = (sy - pany) / zoom;
     if (panning) { panx += dx; pany += dy; }
     switch (drag) {
@@ -1534,10 +2008,9 @@ static void on_cursor(GLFWwindow *w, double sx, double sy) {
         if (!base) { checkpoint(); base = undo[nundo - 1].it; sel_bbox(sbase); } /* no undo entry for a plain click */
         float mx = wx - pressx, my = wy - pressy;
         if (snap) { mx = snapf(sbase[0] + mx) - sbase[0]; my = snapf(sbase[1] + my) - sbase[1]; }
-        for (int i = 0; i < nitems; i++) {
-            if (!base[i].sel) continue;
-            items[i] = base[i]; keep_links(&items[i], base);
-            items[i].x0 += mx; items[i].x1 += mx; items[i].y0 += my; items[i].y1 += my;
+        for (int i = 0; i < nitems; i++) { /* a container takes what it holds along */
+            if (!moving(base, i)) continue;
+            items[i] = base[i]; keep_links(&items[i], base); shift(&items[i], mx, my);
         }
         relink();
         break;
@@ -1559,7 +2032,7 @@ static void zoom_at(float sx, float sy, float by) { /* keep the point under (sx,
 }
 static void on_scroll(GLFWwindow *w, double dx, double dy) {
     if (fd_mode) { fd_scroll -= dy * 3; return; }
-    if (custom_dialog || asking) return;
+    if (custom_dialog || asking || disk_asking || permit_shown) return;
     double sx, sy; glfwGetCursorPos(w, &sx, &sy);
     if (sx < panel_w()) { panel_scroll -= dy * 40; return; }
     zoom_at(sx, sy, dy > 0 ? 1.1f : 1 / 1.1f);
@@ -1567,7 +2040,7 @@ static void on_scroll(GLFWwindow *w, double dx, double dy) {
 static void on_char(GLFWwindow *w, unsigned c) {
     int suppressed = suppress_char; suppress_char = 0;
     if (suppressed && (c == '[' || c == ']')) return;
-    if (asking || (!custom_dialog && !fd_mode && editing < 0) || c < 32) return;
+    if (asking || disk_asking || permit_shown || (!custom_dialog && !fd_mode && editing < 0) || c < 32) return;
     char b[4]; int n = 0;
     if (c < 0x80) b[n++] = c;
     else if (c < 0x800) { b[n++] = 0xc0 | c >> 6; b[n++] = 0x80 | (c & 0x3f); }
@@ -1584,6 +2057,11 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) ask_answer(2);
         return;
     }
+    if (permit_shown || disk_asking) { /* Esc says no, Enter takes the highlighted answer */
+        int esc = key == GLFW_KEY_ESCAPE, enter = key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER;
+        if (esc || enter) { if (permit_shown) permit_answer(enter); else disk_answer(enter); }
+        return;
+    }
     if (fd_mode) { fd_key(w, key, mods); return; }
     int control = mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER);
     if (editing >= 0 && control && (key == GLFW_KEY_N || key == GLFW_KEY_O || key == GLFW_KEY_W || key == GLFW_KEY_Q || key == GLFW_KEY_TAB
@@ -1592,22 +2070,23 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         end_edit(); /* tab and file commands finish the text first */
     if (editing >= 0) {
         if (control && (key == GLFW_KEY_S || key == GLFW_KEY_E)) {
-            int i = items[editing].np ? editing : -1, at = caret;
+            int i = *edit_n() ? editing : -1, at = caret, label = edit_label;
             end_edit();
             if (key == GLFW_KEY_S) save_now(); else if (mods & GLFW_MOD_SHIFT) export_svg(); else export_png();
-            if (i >= 0) { checkpoint(); start_edit(i); caret = at; }
+            if (i >= 0) { checkpoint(); if (label) start_label_edit(i); else start_edit(i); caret = at; }
         }
         else if ((mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER)) && key == GLFW_KEY_V) {
             const char *clip = glfwGetClipboardString(w); char *b = clip ? malloc(strlen(clip) + 1) : NULL; int n = 0;
             for (const char *p = clip; b && *p; p++) if ((unsigned char)*p >= 32 || *p == '\n') b[n++] = *p;
-            if (n && items[editing].np + n <= 65536) text_put(b, n); /* same cap as MCP text */
+            if (n && *edit_n() + n <= 65536) text_put(b, n); /* same cap as MCP text */
             free(b);
         }
         else if (!(mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_ALT | GLFW_MOD_SHIFT))
                  && (key == GLFW_KEY_LEFT_BRACKET || key == GLFW_KEY_RIGHT_BRACKET)) {
-            Item *it = &items[editing];
-            width = tool_width[TEXT] = it->width = fminf(64, fmaxf(1, it->width + (key == GLFW_KEY_LEFT_BRACKET ? -1 : 1)));
-            measure(it); suppress_char = 1;
+            Item *it = &items[editing]; float step = key == GLFW_KEY_LEFT_BRACKET ? -1 : 1;
+            if (edit_label) { it->label_size = fminf(64, fmaxf(1, lsize(it) + step)); relink(); }
+            else { width = tool_width[TEXT] = it->width = fminf(64, fmaxf(1, it->width + step)); measure(it); }
+            suppress_char = 1;
         }
         else if (key == GLFW_KEY_ESCAPE) end_edit();
         else if (key == GLFW_KEY_ENTER) text_put("\n", 1);
@@ -1615,8 +2094,8 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         else if (key == GLFW_KEY_DELETE) text_cut(caret, text_step(caret, 1));
         else if (key == GLFW_KEY_LEFT) caret = text_step(caret, -1);
         else if (key == GLFW_KEY_RIGHT) caret = text_step(caret, 1);
-        else if (key == GLFW_KEY_HOME) while (caret && tpool[items[editing].p0 + caret - 1] != '\n') caret--;
-        else if (key == GLFW_KEY_END) while (caret < items[editing].np && tpool[items[editing].p0 + caret] != '\n') caret++;
+        else if (key == GLFW_KEY_HOME) while (caret && edit_s()[caret - 1] != '\n') caret--;
+        else if (key == GLFW_KEY_END) while (caret < *edit_n() && edit_s()[caret] != '\n') caret++;
         return;
     }
     if (key == GLFW_KEY_LEFT_SHIFT || key == GLFW_KEY_RIGHT_SHIFT) return;
@@ -1637,6 +2116,7 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods) {
         case GLFW_KEY_PAGE_UP: doc_switch((cur + ndocs - 1) % ndocs); break;
         case GLFW_KEY_A: for (int i = 0; i < nitems; i++) items[i].sel = 1; set_tool(SELECT); break;
         case GLFW_KEY_D: duplicate(); break;
+        case GLFW_KEY_G: frame_selection(); break;
         case GLFW_KEY_C: copy_sel(); break;
         case GLFW_KEY_X: copy_sel(); delete_selected(); break;
         case GLFW_KEY_V: paste(wx, wy); break;
@@ -1698,20 +2178,20 @@ static int selftest(void) {
     copy_sel(); delete_selected(); assert(nitems == 3 && nclip == 2);
     paste(300, 300); assert(nitems == 5 && items[3].x0 == 300 && items[4].x0 == 390);
     delete_selected(); assert(nitems == 3);
-    assert(save() == 0); nitems = npool = ntpool = 0;
-    assert(load() == 0 && nitems == 3 && npool == 8 && ntpool == 6 && !strcmp(tpool + items[2].p0, "h") && hit(125, 101) == 1);
+    assert(save(0) == 0); nitems = npool = ntpool = 0;
+    assert(load(0) == 0 && nitems == 3 && npool == 8 && ntpool == 6 && !strcmp(tpool + items[2].p0, "h") && hit(125, 101) == 1);
     /* A failed write must leave the last successfully saved board intact. */
     pid_t child = fork(); assert(child >= 0);
     if (!child) {
         signal(SIGXFSZ, SIG_IGN);
         struct rlimit limit = {1, 1}; assert(setrlimit(RLIMIT_FSIZE, &limit) == 0);
-        items[0].color = 7; _exit(save() == -1 ? 0 : 1);
+        items[0].color = 7; _exit(save(0) == -1 ? 0 : 1);
     }
     int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(load() == 0 && items[0].color == 1);
+    assert(load(0) == 0 && items[0].color == 1);
     char bad[160]; snprintf(bad, sizeof bad, "%s/child", file); path = bad;
-    assert(load() == -2); /* ENOTDIR is not a new board */
-    snprintf(bad, sizeof bad, "%s/missing.pb", dir); assert(load() == 0); path = file;
+    assert(load(0) == -2); /* ENOTDIR is not a new board */
+    snprintf(bad, sizeof bad, "%s/missing.pb", dir); assert(load(0) == 0); path = file;
     char *out = export_path("/tmp/project.v1/notes", ".png"); assert(!strcmp(out, "/tmp/project.v1/notes.png")); free(out);
     out = export_path("/tmp/.notes", ".png"); assert(!strcmp(out, "/tmp/.notes.png")); free(out);
     out = export_path("board.png", ".png"); assert(!strcmp(out, "board.png.png")); free(out);
@@ -1732,7 +2212,7 @@ static int selftest(void) {
     on_key(NULL, GLFW_KEY_S, 0, GLFW_PRESS, GLFW_MOD_CONTROL);
     assert(editing == 2); text_put("!", 1); end_edit();
     do_undo(); assert(!strcmp(tpool + items[2].p0, "h"));
-    assert(load() == 0 && !strcmp(tpool + items[2].p0, "h") && items[2].width == oldwidth + 1);
+    assert(load(0) == 0 && !strcmp(tpool + items[2].p0, "h") && items[2].width == oldwidth + 1);
     /* Tabs: each board keeps its own items, pools, and history; a paste carries its pool data across. */
     char other[160], cfg[160], line[200]; snprintf(other, sizeof other, "%s/other.pb", dir);
     setenv("XDG_CONFIG_HOME", dir, 1);
@@ -1742,7 +2222,7 @@ static int selftest(void) {
     paste(0, 0); assert(nitems == 2 && npool == 4 && ntpool == 2 && !strcmp(tpool + items[1].p0, "h") && dirty);
     float px, py; pen_pt(&items[0], 1, &px, &py); assert(items[0].x0 == 0 && items[0].y0 == 0 && px == 50 && items[1].x0 == 100);
     doc_switch(0); assert(nitems == first && nundo == first_undo && path == file);
-    doc_switch(1); path = strdup(other); assert(save() == 0 && !dirty);
+    doc_switch(1); path = strdup(other); assert(save(0) == 0 && !dirty);
     assert(open_path(file) == 0 && cur == 0 && ndocs == 2 && open_path(other) == 0 && cur == 1);
     session_write(); snprintf(cfg, sizeof cfg, "%s/paintboard/session", dir);
     FILE *sf = fopen(cfg, "r"); assert(sf && fgets(line, sizeof line, sf) && atoi(line) == 1);
@@ -1773,9 +2253,12 @@ static void usage(FILE *f) {
         "        T text  V select  E eraser\n"
         "select: click, shift+click, drag a box; drag to move, corner handles to resize\n"
         "link:   start or end a line or arrow on an item, or drag its end onto one; the end then follows the item\n"
+        "label:  double-click a shape or arrow with V to type its label\n"
+        "nest:   a container moves what it holds; drop an item fully inside one to add it, or out of it to take it out\n"
         "edit:   Del delete  Ctrl+Z/Y undo/redo  Ctrl+A all  Ctrl+D duplicate  Ctrl+C/X/V copy/cut/paste\n"
+        "        Ctrl+G put the selection in a dashed frame that moves it along\n"
         "        Ctrl+Shift+Del reset the board (undoable)\n"
-        "style:  1-8 stroke color  [ ] width / text size  G snap to grid\n"
+        "style:  1-8 stroke color  [ ] width / text size  G snap to grid; panel Dash and Elbow for lines and shapes\n"
         "text:   click to type, Enter newline, Esc done, arrows/Home/End move, Ctrl+V paste;\n"
         "        click existing text with T, or double-click it with V, to edit\n"
         "view:   right/middle drag pan  wheel zoom  Ctrl+= / Ctrl+- zoom  0 reset\n"
@@ -1804,7 +2287,7 @@ int main(int argc, char **argv) {
     if (render_mode) { /* paintboard --render FILE [OUT.png|OUT.svg]: the whole board, no window */
         if (mcp_mode || nfiles < 1 || nfiles > 2) { fprintf(stderr, "usage: paintboard --render FILE [OUT.png|OUT.svg]\n"); return 1; }
         fonts_bake(); doc_add(absolute(files[0]));
-        struct stat st; int loaded = stat(path, &st) ? -2 : load();
+        struct stat st; int loaded = stat(path, &st) ? -2 : load(0);
         if (loaded) { fprintf(stderr, loaded == -1 ? "%s: not a paintboard file\n" : "%s: cannot open\n", path); return 1; }
         char *out = nfiles > 1 ? strdup(files[1]) : export_path(path, ".png"); FILE *f = fopen(out, "wb");
         size_t len = strlen(out); int svg = len > 4 && !strcasecmp(out + len - 4, ".svg");
@@ -1819,7 +2302,7 @@ int main(int argc, char **argv) {
     if (collaborating) strcpy(collaboration_status, "Agent tools connected");
     if (mcp_mode) { /* an MCP client needs its board, so a bad file stops startup */
         doc_add(absolute(nfiles ? files[0] : "board.pb"));
-        int loaded = load();
+        int loaded = load(0);
         if (loaded) { if (loaded == -1) fprintf(stderr, "%s: not a paintboard file\n", path); return 1; }
     }
     if (headless) {
@@ -1845,6 +2328,7 @@ int main(int argc, char **argv) {
     glfwMakeContextCurrent(win); glfwSwapInterval(1);
     glfwSetMouseButtonCallback(win, on_button); glfwSetCursorPosCallback(win, on_cursor);
     glfwSetScrollCallback(win, on_scroll); glfwSetKeyCallback(win, on_key); glfwSetCharCallback(win, on_char);
+    glfwSetWindowFocusCallback(win, on_focus);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glEnable(GL_POINT_SMOOTH);
     fonts_upload();
     GLFWcursor *arrow = glfwCreateStandardCursor(GLFW_ARROW_CURSOR), *cross = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR),
@@ -1862,7 +2346,8 @@ int main(int argc, char **argv) {
         if (glfwWindowShouldClose(win)) {
             glfwSetWindowShouldClose(win, 0);
             if (!asking) {
-                custom_dialog = 0;
+                custom_dialog = 0; disk_asking = 0;
+                if (permit_shown) permit_answer(0);
                 if (fd_mode) fd_cancel();
                 if (!pending) { if (!mcp_mode) session_write(); pending = QUIT; quit_tab = 0; proceed(); }
             }
@@ -1870,6 +2355,7 @@ int main(int argc, char **argv) {
         }
         collaboration_pump();
         if (mcp_mode && mcp_pump()) break;
+        disk_poll();
         int fw, fh, ww;
         glfwGetFramebufferSize(win, &fw, &fh); glfwGetWindowSize(win, &ww, &winh);
         /* X11 reports DPI but sizes windows in physical px; Wayland and macOS already size in logical px. */
@@ -1883,13 +2369,16 @@ int main(int argc, char **argv) {
         if (custom_dialog) { ui_hover = 0; custom_ui(); }
         if (fd_mode) { ui_hover = 0; fd_ui(); }
         if (asking) { ui_hover = 0; ask_ui(); }
-        int modal = custom_dialog || fd_mode || asking;
+        if (disk_asking) { ui_hover = 0; disk_ui(); }
+        if (permit_shown) { ui_hover = 0; permit_ui(); }
+        int modal = custom_dialog || fd_mode || asking || disk_asking || permit_shown;
         glfwSetCursor(win, ui_hover ? hand : modal || lastx < panel_w() || lasty < TAB_H * ui_s || tool == SELECT ? arrow : tool == TEXT ? ibeam : cross);
         char title[PATH_MAX + 32];
         snprintf(title, sizeof title, "paintboard - %s%s", path ? path : "Untitled", dirty ? " \xe2\x80\xa2" : "");
         if (strcmp(title, shown_title)) { glfwSetWindowTitle(win, title); strcpy(shown_title, title); }
         glfwSwapBuffers(win);
-        double notice_left = notice_until - glfwGetTime();
+        double notice_left = notice_until - glfwGetTime(), permit_left = permit_until - glfwGetTime();
+        if (permit_until && (notice_left <= 0 || permit_left < notice_left)) notice_left = fmax(permit_left, .01); /* wake to time out the question */
         if (agent_scanning) glfwWaitEventsTimeout(.1);
         else if (notice_left > 0) glfwWaitEventsTimeout(notice_left);
         else glfwWaitEvents();

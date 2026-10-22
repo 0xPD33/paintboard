@@ -14,6 +14,9 @@ Excalidraw is the reference. This is the small offline version of it.
 
 - Freehand pen, marker, line, arrow, rectangle, ellipse, diamond, triangle, star, and text.
 - Lines and arrows that start or end on an item stay linked to it when it moves.
+  A linked end stops at the item's outline, also on a diamond or an ellipse.
+- Labels that belong to a shape or an arrow and move with it. Double-click to type one.
+- Containers that carry the items inside them when you move them.
 - Eraser that removes every item it touches. Empty shapes erase only at their outline.
 - Select one item, shift click to add more, or drag a box around a group.
 - Move a selection, or drag a corner handle to resize it.
@@ -28,7 +31,10 @@ Excalidraw is the reference. This is the small offline version of it.
 - Two fonts are built into the binary, so the program has no font setup.
 - The panel scales with the monitor DPI and scrolls on short windows.
 - MCP server for agents to inspect and edit a live canvas, or work headlessly.
-  Agents get tab tools, labeled shapes, connecting arrows, and a built-in guide.
+  Agents get tab tools, graph layout, items with stable ids, captions, tables,
+  wrapped text, dashed lines, elbow arrows with waypoints, and a built-in guide.
+- A board that another program saves reloads in its tab, and a save never
+  replaces that version without asking.
 - `paintboard --render` draws a whole board to PNG or SVG with no window.
 - Optional collaboration: pause while drawing and Codex, Claude Code, OpenCode,
   or a custom agent replies on the canvas.
@@ -116,6 +122,15 @@ absolute path, or a path that starts with `~/`. Save As adds `.pb` to a name
 with no extension, and asks before it replaces a file. If a board is already
 open, Open switches to its tab. Copy and paste work between tabs.
 
+Another program, such as a headless agent or a script, can save a board that is
+open in a tab. Paintboard looks at the file when the window gets the focus and
+when you switch to the tab:
+
+- A tab with no unsaved changes loads the new file. Undo brings back the version before it.
+- A tab with unsaved changes asks: **Reload**, **Overwrite**, or **Keep mine**.
+
+Save asks the same question when the file changed since the tab read or saved it.
+
 ### Tools
 
 | Key | Tool |
@@ -134,9 +149,20 @@ open, Open switches to its tab. Copy and paste work between tabs.
 | `E` | Eraser |
 
 Start a line or an arrow on an item, or end it on one, to link that end. A
-linked end stays on the item's edge when you move or resize the item. To link an
+linked end stays on the item's outline when you move or resize the item. To link an
 existing end, select the line or arrow and drag its corner handle onto an item.
 Moving the line or arrow without its item unlinks that end.
+
+Double-click a shape, a line, or an arrow with the select tool to type its
+label. A shape centers its label and wraps it to fit. A line or an arrow shows
+its label halfway along. The label moves with its item. `[` and `]` change the
+label size while you type, and erasing all the text removes the label.
+
+A shape that holds other items is a container. It shows its label at the top
+left, and moving it moves what it holds. Drop an item fully inside a container
+to add it, and drag an item out to take it out. `Ctrl+G` puts the selection in a
+new dashed container, just behind it, with room on top for a label. Agents also
+create containers, and tables, through MCP.
 
 ### Select and edit
 
@@ -153,6 +179,7 @@ Moving the line or arrow without its item unlinks that end.
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` or `Ctrl+Shift+Z` | Redo |
 | `Ctrl+D` | Duplicate |
+| `Ctrl+G` | Put the selection in a dashed container |
 | `Ctrl+C`, `Ctrl+X`, `Ctrl+V` | Copy, cut, paste at the pointer |
 | `Ctrl+Shift+Del` or the Reset button | Clear the board and reset the view. `Ctrl+Z` brings the items back |
 
@@ -163,12 +190,17 @@ Moving the line or arrow without its item unlinks that end.
 | `1` to `8` | Set the stroke color |
 | `[` and `]` | Change the stroke width, or the text size for text |
 | Panel `S`, `M`, `L`, `XL` | Pick a preset size for the current tool or the selection |
-| `G` | Turn grid snapping on or off |
+| `G` or panel **Snap** | Turn grid snapping on or off |
+| Panel **Dash** | Dashed strokes for new lines, arrows, and shapes, or for the selection |
+| Panel **Elbow** | Right-angle routes for new lines and arrows, or for the selected ones |
 | Panel swatches | Set the stroke color and the fill color |
 
 Each tool keeps its own size, so the pen, the marker, and text do not share one
 width. A style key changes the current tool setting. If something is selected, it
-also changes the selection.
+also changes the selection. A panel control that would change nothing for the
+current tool and the selection is greyed out: with the pen, the fill, Snap,
+Dash, and Elbow; with the eraser, also the colors and the width. Pick the tool
+first, then its style.
 
 ### Text
 
@@ -218,8 +250,12 @@ paintboard notes.pb
   thinking. Finish text editing with Esc before expecting a response.
 - Ask your connected agent in chat to look at the drawing or add something.
   Its tools attach to this same window.
-- Turn Collaborate off to stop the watcher and block agent reads and edits.
-  Responses based on an older drawing or a previous toggle session are discarded.
+- Turn Collaborate off to stop the watcher. Responses based on an older drawing
+  or a previous toggle session are discarded.
+- While Collaborate is off, a chat agent's call opens a question in the window,
+  such as "claude-code wants to call add_items". **Allow once** answers this
+  call. **Allow for this session** turns Collaborate on without automatic
+  replies. **Deny** or no answer within 45 seconds refuses the call.
 - Each response is one undo step. Agent edits and Undo/Redo do not trigger
   another automatic reply; the watcher waits for your next drawing edit.
 
@@ -309,6 +345,23 @@ python3 ./paintboard-bridge --call get_board
 python3 ./paintboard-bridge --call get_canvas --image-out /tmp/canvas.png
 ```
 
+Scripts do not need their own MCP client. `--call` repeats, and each `--args`
+belongs to the `--call` before it. `--args @FILE` reads the arguments from a
+file, and `--args @-` from stdin. `--file` runs the calls on a board file in a
+headless `paintboard`, with no window:
+
+```sh
+paintboard-bridge --file board.pb \
+  --call add_graph --args @graph.json \
+  --call update_items --args '{"items": [{"id": "ship", "item": {"type": "diamond", "x0": 680, "y0": 80, "x1": 840, "y1": 180, "fill": 1}}]}' \
+  --call export_svg
+```
+
+One call prints indented JSON. Several calls print one line of JSON each. With
+`--file`, the board saves when every call succeeds. A failed call stops the run,
+names the call, and leaves the file as it was. A window that has the file open
+reloads it, as described in [Files and tabs](#files-and-tabs).
+
 The binary still supports client-owned stdio sessions and headless automation:
 
 ```sh
@@ -350,9 +403,11 @@ The server exposes these tools:
 | `get_status` | Discover the active tab, tab count, toggle state, human revision, and whether editing is in progress |
 | `get_canvas` | Read a canvas image without writing an export file |
 | `get_board` | Read items, bounds, viewport, and the current revision; supports pagination |
-| `add_items` | Add a batch of shapes, pen strokes, or text, with labels and connecting arrows |
-| `update_items` | Replace complete items at specified indices |
-| `delete_items` | Delete specified indices |
+| `add_items` | Add a batch of items, with ids, labels, captions, and connecting arrows |
+| `add_graph` | Lay out nodes, edges, and groups, and draw them |
+| `update_items` | Replace complete items, named by id or by index |
+| `replace_items` | Swap the whole board for a new list of items |
+| `delete_items` | Delete items by id or by index |
 | `undo`, `redo` | Use the shared human/agent history |
 | `set_view` | Set pan and zoom to frame the drawing |
 | `save_board` | Save the active tab, or Save As with `path` |
@@ -368,28 +423,62 @@ coordinates, palette, layout, and an example diagram.
 
 Start with `get_board` and `get_canvas`. When adding a response to a snapshot,
 pass its `revision` and `collaboration_epoch` to `add_items` so late responses are
-rejected. `update_items`, `delete_items`, `undo`, and `redo` require
-the latest `revision`, returned by reads and edits. A stale revision is rejected;
-read the board again before retrying. Indices follow paint order and can shift
-after deletion or undo. Edits are rejected while a human is dragging or typing.
-Each successful batch is one undo step, and an invalid batch changes nothing.
+rejected. Items keep their `id` in the file, so a script can name them later:
+`update_items` and `delete_items` take ids without a `revision`. An edit that
+uses a board index, and `undo` and `redo`, need the latest `revision`, returned
+by reads and edits. A stale revision is rejected; read the board again before
+retrying. Indices follow paint order and can shift after deletion or undo.
+Edits are rejected while a human is dragging or typing. Each successful batch is
+one undo step, and an invalid batch changes nothing.
 
-For example, the arguments to `add_items` can be:
+For boxes and arrows, `add_graph` does the layout. It takes `nodes` and `edges`,
+and optional `direction` (`right` or `down`), `x`, `y`, and `elbow`:
+
+```json
+{
+  "nodes": [
+    {"id": "plan", "label": "Plan", "fill": 3, "group": "Team"},
+    {"id": "build", "label": "Build", "caption": "two weeks", "fill": 2, "group": "Team"},
+    {"id": "ship", "label": "Ship?", "shape": "diamond", "fill": 4}
+  ],
+  "edges": [
+    {"from": "plan", "to": "build"},
+    {"from": "build", "to": "ship"},
+    {"from": "ship", "to": "plan", "label": "no", "dashed": true}
+  ]
+}
+```
+
+Nodes rank along the longest path from a source. `rank` pins a node's position
+along the flow: its column when the graph runs right, its row when it runs down. The
+nodes of a `group` sit together in a dashed container that has the group name as
+its id. An edge that closes a cycle routes around the graph with right angles.
+Node ids become item ids. The graph goes below what is already on the board.
+
+To place items by hand, the arguments to `add_items` can be:
 
 ```json
 {
   "items": [
     {"type": "rect", "id": "plan", "x0": 220, "y0": 80, "x1": 380, "y1": 140, "fill": 3, "color": 3, "label": "Plan"},
-    {"type": "rect", "id": "build", "x0": 460, "y0": 80, "x1": 620, "y1": 140, "fill": 2, "color": 2, "label": "Build"},
-    {"type": "arrow", "from": "plan", "to": "build"}
+    {"type": "rect", "id": "build", "x0": 460, "y0": 80, "x1": 620, "y1": 140, "fill": 2, "color": 2, "label": "Build", "caption": "two weeks"},
+    {"type": "arrow", "from": "plan", "to": "build", "label": "then"}
   ]
 }
 ```
 
-A `label` adds black text centered on its shape. `from` and `to` take a board
-index or the `id` of an earlier item in the batch, and the arrow's ends stop at
-the two items. The ends stay linked: when the human or `update_items` moves an
-item, its arrows follow. An invalid item names its position and the reason.
+A `label` belongs to its shape, line, or arrow and moves with it. A `caption`
+adds a smaller gray line under a shape's label. `from`, `to`, and `parent` take
+a board index, an id on the board, or the id of an earlier item in the batch.
+The arrow's ends stop at the outlines of the two items and stay linked: when the
+human or `update_items` moves an item, its arrows follow. An invalid item names
+its position and the reason. Other fields:
+
+- `points` on a line or an arrow are waypoints, and `elbow: true` turns the route at right angles.
+- `dashed: true` draws a dashed stroke on a line, an arrow, or a shape.
+- `parent` puts an item in a container; moving the container moves what it holds.
+- `wrap` on a text item wraps its lines at that width.
+- A `table` takes `x0`, `y0`, `x1`, and `rows` of cells, and sizes its rows to the text.
 
 Coordinates are world units. At the default view, the tool panel covers the left
 168 logical pixels times the UI scale; `get_board` reports the window size.
@@ -402,7 +491,11 @@ available through `tools/list`.
 Tools act on the active tab, and a tab switch changes the revision. Call
 `save_board` to persist edits explicitly; an Untitled tab has no file to save.
 Closing the window asks about unsaved changes. Closing the client-owned
-`paintboard --mcp` stdin saves every tab that has a file, without a question.
+`paintboard --mcp` stdin saves every tab that has a file and unsaved changes,
+without a question. It does not replace a file that another program saved
+meanwhile; it reports that on stderr and exits with status 1. `save_board` refuses
+the same case unless you pass `overwrite: true`, and `open_board` with
+`reload: true` loads the new file as one undo step.
 Disconnecting the attachment bridge does not close or save the window. The MCP implementation follows the
 [stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 and [tool protocol](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
@@ -415,17 +508,20 @@ the three built-in CLI adapters without making model calls.
 streaming, permission denial, timeouts, and stale-response cancellation.
 `tests/test_collaboration_live.py` uses X11 and XTest on a private test display
 to exercise the selector, custom setup, saved configuration, and replies. It also
-drives the tabs, the file dialog, the close question, and session restore, and
+drives the tabs, the file dialog, the close question, session restore, the
+question before an agent call, reloads after another program saves, labels, and
+containers, and
 saves screenshots to `PAINTBOARD_TEST_ARTIFACTS` (default
 `$TMPDIR/paintboard-e2e`). The window must open at 1088 by 870, which a
-1280 by 1024 Xvfb screen gives. The real Codex
+1280 by 1024 Xvfb screen gives. In a Wayland session, unset `WAYLAND_DISPLAY`,
+or GLFW opens the test windows on your desktop instead. The real Codex
 smoke test is opt-in with `PAINTBOARD_TEST_REAL_CODEX=1`.
 
 ## Files
 
 A board is one binary file. The format is described in
-[ARCHITECTURE.md](ARCHITECTURE.md). Paintboard also reads the older `PB02` and
-`PB03` files and writes them back in the current format.
+[ARCHITECTURE.md](ARCHITECTURE.md). Paintboard also reads the older `PB02`, `PB03`,
+and `PB04` files and writes them back in the current format, `PB05`.
 
 
 ## Design notes

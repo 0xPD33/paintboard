@@ -9,10 +9,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 sys.dont_write_bytecode = True
-from test_collaboration import bridge, BINARY
+from test_collaboration import bridge, BINARY, BRIDGE
 ARTIFACTS = Path(os.environ.get("PAINTBOARD_TEST_ARTIFACTS", Path(tempfile.gettempdir()) / "paintboard-e2e"))
 
 
@@ -216,7 +217,7 @@ print(json.dumps({'annotations':[{'type':'text','x0':400,'y0':250,'text':'Custom
         self.drag(367, 693, 460, 340)  # drag the line's end handle onto A: that end links
         self.screenshot("linked-arrows-live")
         self.key(ord('s'), control=True)
-        self.wait(lambda: board.exists() and board.read_bytes()[:4] == b"PB04")
+        self.wait(lambda: board.exists() and board.read_bytes()[:4] == b"PB05")
         lines = subprocess.run([BINARY, "--mcp", "--headless", str(board)], capture_output=True, timeout=10, input="\n".join(json.dumps(m) for m in [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}},
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -315,6 +316,129 @@ print(json.dumps({'annotations':[{'type':'text','x0':400,'y0':250,'text':'Custom
         with self.assertRaises(bridge.ToolError):
             bridge.data(self.endpoint, "add_items", revision=self.status()["revision"], collaboration_epoch=state["collaboration_epoch"],
                         items=[{"type": "text", "x0": 0, "y0": 0, "text": "stale epoch"}])
+
+    def asked_call(self, name, **args):
+        """Call a tool as a named client, as the MCP proxy does, without waiting for the human's answer."""
+        outcome = {}
+        def run():
+            try:
+                outcome["result"] = bridge.tool(self.endpoint, name, client="test-agent", **args)
+            except bridge.ToolError as error:
+                outcome["error"] = str(error)
+        thread = threading.Thread(target=run); thread.start()
+        time.sleep(.5)
+        return thread, outcome
+
+    def headless(self, board, *calls):
+        """Edit a board file in another process, the way a script does."""
+        args = [part for name, arguments in calls for part in ("--call", name, "--args", json.dumps(arguments))]
+        done = subprocess.run([sys.executable, str(BRIDGE), "--file", str(board), *args], capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return [json.loads(line) for line in done.stdout.splitlines()] if len(calls) > 1 else [json.loads(done.stdout)]
+
+    def test_agent_call_asks_while_collaborate_is_off(self):
+        self.start()
+        with self.assertRaises(bridge.ToolError):  # no client name, as from the watcher: refused at once
+            bridge.data(self.endpoint, "get_board")
+        thread, outcome = self.asked_call("get_board")
+        self.screenshot("permit-dialog")
+        self.key(0xff0d)  # Enter: allow once
+        thread.join(5)
+        self.assertEqual(outcome["result"]["structuredContent"]["total"], 0)
+        self.assertFalse(self.status()["collaborating"])
+        thread, outcome = self.asked_call("add_items", items=[{"type": "text", "x0": 400, "y0": 300, "text": "denied"}])
+        self.key(0xff1b)  # Esc: deny
+        thread.join(5)
+        self.assertIn("declined", outcome["error"])
+        self.assertEqual(self.status()["total"], 0)
+        thread, outcome = self.asked_call("add_items", items=[{"type": "text", "x0": 400, "y0": 300, "text": "allowed"}])
+        self.click(727, 484)  # Allow for this session
+        thread.join(5)
+        state = self.status()
+        self.assertEqual((state["total"], state["collaborating"], state["status"]), (1, True, "Chat tools connected"))
+        self.draw(); time.sleep(2.5)
+        self.assertEqual(self.status()["total"], 2)  # no automatic reply: the session allowed only tools
+        bridge.tool(self.endpoint, "get_board", client="test-agent")  # no question while Collaborate is on
+
+    def test_reload_and_overwrite_when_another_program_saves(self):
+        board = self.dir / "shared.pb"
+        box = lambda x: {"type": "rect", "x0": x, "y0": 400, "x1": x + 80, "y1": 460}
+        self.headless(board, ("add_items", {"items": [box(300)]}))
+        self.start(files=[str(board)])
+        self.headless(board, ("add_items", {"items": [box(400)]}))
+        self.key(ord('n'), control=True); self.wait(lambda: self.status()["tabs"] == 2)
+        self.key(0xff09, control=True)  # back to the clean tab: it reloads without a question
+        self.wait(lambda: self.status()["path"] == str(board) and self.status()["total"] == 2)
+        self.draw()  # unsaved work in the window
+        self.headless(board, ("add_items", {"items": [box(500), box(600)]}))
+        self.key(0xff09, control=True); time.sleep(.3); self.key(0xff09, control=True)  # away and back
+        self.wait(lambda: self.status()["busy"]); self.screenshot("disk-changed-dialog")
+        self.key(0xff0d)  # Enter: reload
+        self.wait(lambda: not self.status()["busy"] and self.status()["total"] == 4)
+        self.key(ord('z'), control=True)  # Undo brings the window's version back
+        self.wait(lambda: self.status()["total"] == 3)
+        self.headless(board, ("add_items", {"items": [box(700)]}))
+        self.key(ord('s'), control=True)  # the file changed again: Save asks first
+        self.wait(lambda: self.status()["busy"])
+        self.click(642, 484)  # Overwrite
+        self.wait(lambda: not self.status()["busy"])
+        self.assertEqual(self.headless(board, ("get_status", {}))[0]["total"], 3)
+
+    def test_double_click_labels_and_containers_carry_children(self):
+        board = self.dir / "nest.pb"
+        self.headless(board, ("add_items", {"items": [
+            {"type": "rect", "id": "frame", "x0": 300, "y0": 200, "x1": 700, "y1": 500, "label": "Frame"},
+            {"type": "rect", "id": "child", "parent": "frame", "x0": 360, "y0": 300, "x1": 480, "y1": 380},
+            {"type": "ellipse", "id": "outside", "x0": 800, "y0": 300, "x1": 900, "y1": 380}]}))
+        self.start(files=[str(board)])
+        self.key(ord('v'))
+        self.click(420, 340); time.sleep(.05); self.click(420, 340)  # double-click a shape to label it
+        self.wait(lambda: self.status()["busy"])
+        self.type_command("step"); self.screenshot("label-editing")
+        self.key(0xff1b)
+        self.wait(lambda: not self.status()["busy"])
+        self.drag(600, 450, 600, 550)  # the frame moves 100 down and takes its child along
+        self.drag(850, 340, 550, 500)  # dropped inside the frame, the ellipse joins it
+        self.drag(420, 440, 420, 700)  # dragged out of the frame, the child leaves it
+        self.screenshot("containers")
+        self.key(ord('s'), control=True)
+        self.wait(lambda: not self.status()["path"] or board.stat().st_mtime > 0)
+        time.sleep(.3)
+        items = {e["item"]["id"]: e["item"] for e in self.headless(board, ("get_board", {}))[0]["items"]}
+        self.assertEqual((items["frame"]["y0"], items["child"]["label"]), (300, "step"))
+        self.assertEqual((items["child"]["y0"], "parent" in items["child"]), (660, False))
+        self.assertEqual((items["outside"]["x0"], items["outside"]["parent"]), (500, 0))
+
+    def test_panel_dash_elbow_and_frame(self):
+        board = self.dir / "styles.pb"
+        self.start(files=[str(board)])
+        self.click(84, 482); time.sleep(.2)  # the pen takes no dashes, so Dash is greyed out and ignores the click
+        self.screenshot("panel-pen-tool")
+        self.key(ord('e')); self.screenshot("panel-eraser-tool")  # colors, fill, and width do nothing for the eraser
+        self.key(ord('r')); self.drag(400, 300, 520, 380)
+        self.click(84, 482); time.sleep(.2)  # live for the rectangle tool: the next rectangle is dashed
+        self.drag(700, 450, 820, 530)
+        self.key(ord('a')); self.click(136, 482); time.sleep(.2)  # Elbow is live for arrows
+        self.drag(460, 340, 760, 490)  # linked at both ends, routed with right angles
+        self.key(ord('a'), control=True)
+        self.key(ord('g'), control=True)  # frame the selection
+        self.wait(lambda: self.status()["total"] == 4)
+        self.screenshot("dash-elbow-frame")
+        time.sleep(.2); self.click(84, 482); time.sleep(.2)  # with the frame selected, Dash turns its dashes off
+        self.key(ord('s'), control=True)
+        time.sleep(.5)
+        items = [e["item"] for e in self.headless(board, ("get_board", {}))[0]["items"]]
+        self.assertEqual([i["type"] for i in items], ["rect", "rect", "rect", "arrow"])
+        frame, first, second, arrow = items
+        self.assertEqual((frame["color"], "dashed" in frame, "parent" in frame), (7, False, False))
+        self.assertEqual((first["parent"], second["parent"], arrow["parent"]), (0, 0, 0))
+        self.assertTrue("dashed" not in first and second["dashed"] and arrow["dashed"] and arrow["elbow"])
+        self.assertEqual((arrow["from"], arrow["to"]), (1, 2))
+        self.assertTrue(frame["x0"] < 400 and frame["y0"] <= 260 and frame["x1"] > 820 and frame["y1"] > 530, frame)
+        self.key(ord('v')); self.drag(390, 270, 390, 370)  # drag the frame by its top band: everything moves
+        self.key(ord('s'), control=True); time.sleep(.5)
+        moved = [e["item"] for e in self.headless(board, ("get_board", {}))[0]["items"]]
+        self.assertEqual((moved[1]["y0"], moved[2]["y0"]), (400, 550))
 
     def test_toggle_off_cancels_thinking(self):
         self.start(delay="5")

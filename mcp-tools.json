@@ -15,7 +15,8 @@
           "diamond",
           "triangle",
           "star",
-          "highlight"
+          "highlight",
+          "table"
         ]
       },
       "x0": {
@@ -31,7 +32,8 @@
       "x1": {
         "type": "number",
         "minimum": -1000000,
-        "maximum": 1000000
+        "maximum": 1000000,
+        "description": "Shapes: the second corner. Lines and arrows: the end. Tables: the right edge."
       },
       "y1": {
         "type": "number",
@@ -78,26 +80,26 @@
             "maximum": 1000000
           }
         },
-        "description": "Absolute world-coordinate [x,y] pairs for pen and highlight strokes."
+        "description": "Pen and highlight: absolute [x, y] pairs. Line and arrow: 1-100 waypoints the route passes through; linked ends still follow their items."
       },
       "id": {
         "type": "string",
         "minLength": 1,
         "maxLength": 64,
-        "description": "add_items only: a name that later items in the same batch can use in from/to."
+        "description": "A unique name for the item, kept in the board file. update_items and delete_items take it, and from, to, and parent can name it."
       },
       "label": {
         "type": "string",
         "minLength": 1,
         "maxLength": 65536,
-        "description": "add_items only, for rect, ellipse, diamond, triangle, and star: black text centered on the shape. It becomes a separate text item placed right after the shape."
+        "description": "Shapes, lines, and arrows: text that belongs to the item and moves with it. A shape centers it and wraps it to fit; a container shows it at its top left; a line or arrow shows it halfway along."
       },
       "label_size": {
         "type": "number",
         "minimum": 1,
         "maximum": 64,
         "default": 3,
-        "description": "Text size of the label, like a text item's width (7 px per unit)."
+        "description": "Text size of the label, 7 px per unit; a caption is 3/4 of it. For a table, the cell text size."
       },
       "from": {
         "oneOf": [
@@ -109,7 +111,7 @@
             "type": "string"
           }
         ],
-        "description": "For line and arrow: link the start to this item, given as a board index, or in add_items also the id of an earlier item in the batch. A linked end stops just outside the item's bounding box and follows the item when it moves or resizes. Coordinates for a linked end are optional and are recomputed. get_board reports links as board indices."
+        "description": "For line and arrow: link the start to this item, given as a board index or an id, or in add_items and replace_items the id of an earlier item in the batch. A linked end stops just outside the item's outline and follows the item when it moves or resizes. Coordinates for a linked end are optional and are recomputed. get_board reports links as board indices."
       },
       "to": {
         "oneOf": [
@@ -122,6 +124,56 @@
           }
         ],
         "description": "Link the end of the line or arrow to this item; see from."
+      },
+      "caption": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 65536,
+        "description": "Shapes: a smaller gray line under the label."
+      },
+      "wrap": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1000000,
+        "default": 0,
+        "description": "Text items: wrap lines at this width in world units. 0 does not wrap."
+      },
+      "dashed": {
+        "type": "boolean",
+        "default": false,
+        "description": "Lines, arrows, and shapes: a dashed stroke, for example for an optional relation."
+      },
+      "elbow": {
+        "type": "boolean",
+        "default": false,
+        "description": "Lines and arrows: route with right angles. A linked end leaves from the middle of a side."
+      },
+      "parent": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "Put the item in a container: a board index or an id, or in add_items and replace_items the id of an earlier item in the batch. Moving the container moves what it holds. get_board reports it as a board index."
+      },
+      "rows": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 100,
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "description": "Tables: rows of cells, each row the same length. The first row is the header and takes the fill. x1 sets the width; the height follows the wrapped text."
       }
     },
     "required": [
@@ -229,6 +281,23 @@
             }
           ]
         }
+      },
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "const": "table"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "x0",
+            "y0",
+            "x1",
+            "rows"
+          ]
+        }
       }
     ]
   },
@@ -273,7 +342,7 @@
     },
     {
       "name": "add_items",
-      "description": "Append up to 1000 items in paint order as one undo step. Returns their indices, their bounds [x0, y0, x1, y1], and the new revision. Defaults: black stroke, width 3, no fill. Text size is width * 7. Shapes can carry a centered label, and lines or arrows can link to items with from/to instead of coordinates; linked ends follow the items. An invalid item names its position and the reason, and nothing changes. Does not save automatically; call save_board when finished.",
+      "description": "Append up to 1000 items in paint order as one undo step. Returns their indices, their bounds [x0, y0, x1, y1], and the new revision. Defaults: black stroke, width 3, no fill. Text size is width * 7. Give items an id to edit them later by name. Shapes take a label and a caption, lines and arrows a label, and lines or arrows link to items with from/to instead of coordinates; linked ends follow the items. parent puts an item in a container. An invalid item names its position and the reason, and nothing changes. Does not save automatically; call save_board when finished.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -307,41 +376,258 @@
       }
     },
     {
+      "name": "add_graph",
+      "description": "Lay out a graph and draw it as one undo step: shapes with labels, linked arrows, and dashed group containers. Ranks run right (or down) along the longest path; rank pins a node's position along the flow; nodes in a group sit together. Edges that close a cycle go around the graph. Node ids become item ids. By default the graph goes at (200, 80), or below what is on the board. Returns like add_items.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nodes"
+        ],
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 300,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "The node's item id; edges and later edits use it."
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 65536,
+                  "description": "Default: the id."
+                },
+                "caption": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 65536,
+                  "description": "A smaller line under the label."
+                },
+                "shape": {
+                  "type": "string",
+                  "enum": [
+                    "rect",
+                    "ellipse",
+                    "diamond",
+                    "triangle",
+                    "star"
+                  ],
+                  "default": "rect"
+                },
+                "color": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 7,
+                  "description": "Default: the fill's hue, else black."
+                },
+                "fill": {
+                  "type": "integer",
+                  "minimum": -1,
+                  "maximum": 7,
+                  "default": -1
+                },
+                "rank": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 999,
+                  "description": "Pin the node's position along the flow, counted from 0: the column when direction is right, the row when it is down. Nodes with the same rank sit side by side across the flow. Without it, the rank follows the longest path from a source."
+                },
+                "group": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "Nodes with the same group sit in one dashed container named by it, with that id."
+                },
+                "dashed": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "edges": {
+            "type": "array",
+            "maxItems": 300,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "from",
+                "to"
+              ],
+              "properties": {
+                "from": {
+                  "type": "string",
+                  "description": "A node id, or the id of an item on the board."
+                },
+                "to": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 65536
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "arrow",
+                    "line"
+                  ],
+                  "default": "arrow"
+                },
+                "color": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 7
+                },
+                "dashed": {
+                  "type": "boolean"
+                },
+                "elbow": {
+                  "type": "boolean",
+                  "description": "Default: the graph's elbow. An edge that closes a cycle always routes around the graph with elbows."
+                }
+              }
+            }
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "right",
+              "down"
+            ],
+            "default": "right"
+          },
+          "x": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000,
+            "description": "Left edge of the graph."
+          },
+          "y": {
+            "type": "number",
+            "minimum": -1000000,
+            "maximum": 1000000,
+            "description": "Top edge of the graph."
+          },
+          "elbow": {
+            "type": "boolean",
+            "default": false,
+            "description": "Route every edge with right angles."
+          }
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "update_items",
-      "description": "Replace items at the supplied indices, atomically as one undo step. Supply COMPLETE item definitions, not patches. Use the revision from get_board or the last edit; stale revisions are rejected. Indices must be unique. Moving or resizing an item moves the line and arrow ends linked to it. Give from/to again to keep a replaced connector linked.",
+      "description": "Replace items, named by id or by index, as {id, item}, {index, item}, or a complete item that carries its id, atomically as one undo step. Supply COMPLETE item definitions, not patches; an item keeps its id unless the definition names a new one. revision is required when any entry or from/to/parent uses a board index, and optional when everything is named by id. Moving a container moves what it holds, and moving an item moves the line and arrow ends linked to it. Give from/to again to keep a replaced connector linked.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "revision": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "The revision from get_board or the last edit. Required when the batch uses a board index."
           },
           "items": {
             "type": "array",
             "minItems": 1,
             "maxItems": 1000,
             "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "index": {
-                  "type": "integer",
-                  "minimum": 0
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64,
+                      "description": "The id of the item to replace."
+                    },
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "The board index of the item to replace; needs revision."
+                    },
+                    "item": {
+                      "$ref": "#/$defs/item"
+                    }
+                  },
+                  "required": [
+                    "item"
+                  ],
+                  "oneOf": [
+                    {
+                      "required": [
+                        "id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "index"
+                      ]
+                    }
+                  ]
                 },
-                "item": {
-                  "$ref": "#/$defs/item"
+                {
+                  "$ref": "#/$defs/item",
+                  "required": [
+                    "id"
+                  ],
+                  "description": "A complete item that names the item to replace by its id, the way add_items takes items."
                 }
-              },
-              "required": [
-                "index",
-                "item"
               ]
             }
           }
         },
         "required": [
-          "revision",
+          "items"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "replace_items",
+      "description": "Swap the whole board for these items as one undo step, for scripts that rebuild a board. Items take the same fields as add_items; from, to, and parent name ids of earlier items in the batch. An empty list clears the board. revision is optional.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 1000,
+            "items": {
+              "$ref": "#/$defs/item"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional expected revision."
+          }
+        },
+        "required": [
           "items"
         ]
       },
@@ -352,14 +638,15 @@
     },
     {
       "name": "delete_items",
-      "description": "Delete the listed unique indices as one undo step. Requires the current revision. Remaining indices shift, so inspect the board again afterwards. Line and arrow ends linked to a deleted item stay where they are, unlinked.",
+      "description": "Delete items by index, by id, or both, as one undo step. Indices need the current revision; ids do not. Remaining indices shift, so inspect the board again afterwards. Line and arrow ends linked to a deleted item stay where they are, unlinked, and items in a deleted container stay.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "revision": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "Required with indices."
           },
           "indices": {
             "type": "array",
@@ -369,13 +656,20 @@
             "items": {
               "type": "integer",
               "minimum": 0
-            }
+            },
+            "description": "Board indices; they need revision."
+          },
+          "ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            },
+            "description": "Item ids. Give ids, indices, or both."
           }
-        },
-        "required": [
-          "revision",
-          "indices"
-        ]
+        }
       },
       "annotations": {
         "destructiveHint": true,
@@ -426,7 +720,7 @@
     },
     {
       "name": "save_board",
-      "description": "Atomically save the active tab. Pass path (absolute, or relative to the server's directory) to save under a new name, as Save As does; an Untitled tab needs it. Refuses a path that another tab has open.",
+      "description": "Atomically save the active tab. Pass path (absolute, or relative to the server's directory) to save under a new name, as Save As does; an Untitled tab needs it. Refuses a path that another tab has open. Refuses to replace a file that changed on disk since the tab read or saved it, unless overwrite is true.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -434,6 +728,11 @@
           "path": {
             "type": "string",
             "minLength": 1
+          },
+          "overwrite": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace the file even when another program saved it since this tab read it."
           }
         }
       },
@@ -570,7 +869,7 @@
     },
     {
       "name": "open_board",
-      "description": "Open a board file in a new tab and make it active. A missing file starts an empty board with that path. An open file switches to its tab.",
+      "description": "Open a board file in a new tab and make it active. A missing file starts an empty board with that path. An open file switches to its tab; with reload, its tab loads the file again as one undo step.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -579,6 +878,11 @@
             "type": "string",
             "minLength": 1,
             "description": "Absolute, or relative to the server's directory."
+          },
+          "reload": {
+            "type": "boolean",
+            "default": false,
+            "description": "Load the file again when its tab is open, for example after another program saved it."
           }
         },
         "required": [
