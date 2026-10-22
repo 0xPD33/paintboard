@@ -1,47 +1,91 @@
+<div align="center">
+
 <img src="assets/paintboard.svg" width="96" alt="Paintboard logo">
 
 # Paintboard
 
-A small local drawing board written in C. Draw freehand, place shapes, add text, and
-move things around. Drawing works offline and boards stay in a single file on
-disk. Optional collaboration sends canvas snapshots to a selected agent for visual replies.
+**An offline whiteboard in one small C program. You draw, and your agents draw with you.**
+
+[![build](https://github.com/0xPD33/paintboard/actions/workflows/release.yml/badge.svg)](https://github.com/0xPD33/paintboard/actions/workflows/release.yml)
+[![release](https://img.shields.io/github/v/release/0xPD33/paintboard)](https://github.com/0xPD33/paintboard/releases/latest)
+[![license](https://img.shields.io/github/license/0xPD33/paintboard)](LICENSE)
+
+[Install](#install) · [Use](#use) · [Agents and MCP](#agents-and-mcp) · [Architecture](ARCHITECTURE.md)
+
+</div>
+
+![Paintboard with a launch plan board: a flow chart in a dashed container, a decision diamond with a loop back, a table, a sticky note, a red hand drawn circle, and the tool panel on the left](assets/hero.png)
+
+Paintboard is a local drawing board written in C. Draw freehand, place shapes,
+and type text on an infinite canvas. Each board is one file on disk, and
+drawing needs no network and no account. Agents such as Claude Code and Codex
+connect through MCP: they read the canvas, lay out diagrams, and ask you before
+they change a board.
 
 Excalidraw is the reference. This is the small offline version of it.
 
-![A release plan board open in Paintboard, with boxes, arrows, text, a freehand stroke, and the tool panel on the left](assets/screenshot.png)
-
 ## Features
 
-- Freehand pen, marker, line, arrow, rectangle, ellipse, diamond, triangle, star, and text.
-- Lines and arrows that start or end on an item stay linked to it when it moves.
-  A linked end stops at the item's outline, also on a diamond or an ellipse.
-- Labels that belong to a shape or an arrow and move with it. Double-click to type one.
-- Containers that carry the items inside them when you move them.
-- Eraser that removes every item it touches. Empty shapes erase only at their outline.
-- Select one item, shift click to add more, or drag a box around a group.
-- Move a selection, or drag a corner handle to resize it.
-- Copy, cut, paste, and duplicate.
-- Undo and redo, up to 256 steps.
-- Eight stroke colors and eight fill colors.
-- Dot grid with optional snapping.
-- Infinite canvas with pan and zoom.
-- Several boards in tabs. New, open, save, and save as with a built-in file dialog.
-- Save to a small binary file. Export the visible canvas to PNG, or the whole board to SVG.
-- The open tabs come back when you start Paintboard again.
-- Two fonts are built into the binary, so the program has no font setup.
-- The panel scales with the monitor DPI and scrolls on short windows.
-- MCP server for agents to inspect and edit a live canvas, or work headlessly.
-  Agents get tab tools, graph layout, items with stable ids, captions, tables,
-  wrapped text, dashed lines, elbow arrows with waypoints, and a built-in guide.
-- A board that another program saves reloads in its tab, and a save never
-  replaces that version without asking.
-- `paintboard --render` draws a whole board to PNG or SVG with no window.
-- Optional collaboration: pause while drawing and Codex, Claude Code, OpenCode,
-  or a custom agent replies on the canvas.
+**Draw**
 
-![A mind map in Paintboard, with a hand drawn red loop circling one of the boxes](assets/screenshot-mindmap.png)
+- Pen, marker, line, arrow, rectangle, ellipse, diamond, triangle, star, text, and eraser.
+- Arrows that stay linked to the shapes at their ends, also on a diamond or an ellipse.
+- Labels and captions that belong to a shape or an arrow. Double-click to type one.
+- Dashed strokes, right-angle arrows with waypoints, wrapped text, and tables.
+- Containers that carry the items inside them.
+- Select, move, resize, copy, paste, and undo up to 256 steps.
+- Eight stroke colors, eight fills, a dot grid with snapping, and pan and zoom.
+- Several boards in tabs, a built-in file dialog, and the last session on restart.
+- Export the view to PNG, or the whole board to SVG.
+
+**Work with agents**
+
+- An MCP server with 20 tools to read the canvas, edit items, lay out graphs, and manage tabs.
+- `add_graph` takes nodes and edges and does the layout.
+- The window asks you before a chat agent changes a board.
+- Pause while you draw, and Codex, Claude Code, OpenCode, or a custom agent replies on the canvas.
+- `paintboard-bridge --file` scripts a board with no window, and `--render` draws a board to PNG or SVG.
+- A board that another program saves reloads in its tab. A save never replaces that version without a question.
+
+<p align="center">
+  <img src="assets/agent.gif" width="100%" alt="You write a question on the board. Claude Code asks to call add_graph. You allow it for this session, and an architecture diagram appears under the question.">
+</p>
+
+<p align="center"><sub>You write a question. Claude Code asks to draw. You allow it, and the diagram appears.</sub></p>
+
+**Small by design**
+
+| Part | Footprint |
+| --- | --- |
+| Program | One 1.2 MB binary. The two fonts and the agent guide are built in. |
+| Source | About 3,600 lines of C and a 700-line Python bridge. |
+| Libraries | OpenGL, EGL, and libc. The release binaries link GLFW and cJSON statically. |
+| Memory | About 130 MB resident for a window, most of it the OpenGL driver. A headless MCP session starts at 7 MB. |
+| Idle CPU | 0%. The window draws only after an input or a change. |
+| Board files | A board of 5,000 items is about 1.1 MB on disk. |
 
 ## Install
+
+### Prebuilt binaries
+
+Each [release](https://github.com/0xPD33/paintboard/releases) has archives for
+x86_64 and aarch64 Linux. They need:
+
+- glibc 2.35 or newer: Ubuntu 22.04, Debian 12, or a newer distribution.
+- An OpenGL driver, such as Mesa or the NVIDIA driver, and X11 or Wayland.
+- Python 3 at `/usr/bin/python3` for the MCP bridge and the agent replies.
+
+To install for one user, unpack the archive into `~/.local`:
+
+```sh
+version=0.5.0 arch=$(uname -m)
+curl -fL https://github.com/0xPD33/paintboard/releases/download/v$version/paintboard-$version-linux-$arch.tar.gz \
+  | tar -xz -C ~/.local --strip-components=1
+```
+
+This puts `paintboard` and `paintboard-bridge` in `~/.local/bin`, and the desktop
+entry and the icons in `~/.local/share`. Use `sudo tar ... -C /usr/local` to
+install for all users. Each archive has a `.sha256` file beside it.
 
 ### Nix flake
 
@@ -87,6 +131,12 @@ up in your application launcher.
 Run `make test` to exercise the board operations and MCP server; the protocol
 tests use Python 3's standard library, included in the development shell.
 
+The `build` workflow makes the release archives. It builds in an Ubuntu 22.04
+container with Clang 19, static GLFW, and static cJSON, and runs `make test`.
+A pushed `v*` tag attaches the archives to the GitHub release. To build an
+archive on your machine, run `.github/build.sh` as root in an `ubuntu:22.04`
+container.
+
 ## Use
 
 ```sh
@@ -98,10 +148,15 @@ paintboard --help
 
 The window opens at 85% of the monitor work area. Each board opens in a tab, and
 a dot on a tab marks unsaved changes. When you close a tab or the window, a board
-with unsaved changes asks you to save it, discard the changes, or cancel. With no file arguments, Paintboard reopens the boards
-that were open when you last closed it, or one Untitled board.
+with unsaved changes asks you to save it, discard the changes, or cancel. With no
+file arguments, Paintboard reopens the boards that were open when you last closed
+it, or one Untitled board.
 
-### Files and tabs
+Pick a tool with its key or in the panel, then drag on the canvas. Right drag
+pans, and the wheel zooms. The sections below list every key.
+
+<details>
+<summary><b>Files and tabs</b></summary>
 
 | Key or action | Result |
 | --- | --- |
@@ -131,7 +186,10 @@ when you switch to the tab:
 
 Save asks the same question when the file changed since the tab read or saved it.
 
-### Tools
+</details>
+
+<details>
+<summary><b>Tools, labels, and containers</b></summary>
 
 | Key | Tool |
 | --- | --- |
@@ -147,6 +205,8 @@ Save asks the same question when the file changed since the tab read or saved it
 | `T` | Text |
 | `V` | Select |
 | `E` | Eraser |
+
+The eraser removes every item it touches. An empty shape erases only at its outline.
 
 Start a line or an arrow on an item, or end it on one, to link that end. A
 linked end stays on the item's outline when you move or resize the item. To link an
@@ -164,7 +224,10 @@ to add it, and drag an item out to take it out. `Ctrl+G` puts the selection in a
 new dashed container, just behind it, with room on top for a label. Agents also
 create containers, and tables, through MCP.
 
-### Select and edit
+</details>
+
+<details>
+<summary><b>Select and edit</b></summary>
 
 | Key or action | Result |
 | --- | --- |
@@ -183,7 +246,10 @@ create containers, and tables, through MCP.
 | `Ctrl+C`, `Ctrl+X`, `Ctrl+V` | Copy, cut, paste at the pointer |
 | `Ctrl+Shift+Del` or the Reset button | Clear the board and reset the view. `Ctrl+Z` brings the items back |
 
-### Style
+</details>
+
+<details>
+<summary><b>Style</b></summary>
 
 | Key or action | Result |
 | --- | --- |
@@ -202,22 +268,26 @@ current tool and the selection is greyed out: with the pen, the fill, Snap,
 Dash, and Elbow; with the eraser, also the colors and the width. Pick the tool
 first, then its style.
 
-### Text
+</details>
+
+<details>
+<summary><b>Text</b></summary>
 
 Pick the text tool and click the canvas to start typing. Press `Enter` for a new
 line and `Esc` when you finish. Click an existing text item with the text tool,
 or double-click it with the select tool, to edit it again. The arrow keys, `Home`,
-and `End` move the caret, `Del` deletes forward, and `Ctrl+V` pastes. Text grows
-and shrinks with `[` and `]`. A click on the panel while you type ends the edit
-and selects the text, so a color or size click applies to it.
-These keys resize the text while typing. `Ctrl+S` saves and `Ctrl+E` exports
-without leaving text editing. Erasing all the text removes the item when you
-finish; undo restores it. Starting an empty item and finishing cancels it.
+and `End` move the caret, `Del` deletes forward, and `Ctrl+V` pastes. `[` and
+`]` resize the text while you type.
 
-The caret always sits at the end. Backspace removes the last character, and there
-are no arrow keys inside a text item yet.
+A click on the panel while you type ends the edit and selects the text, so a
+color or size click applies to it. `Ctrl+S` saves and `Ctrl+E` exports without
+leaving text editing. Erasing all the text removes the item when you finish;
+undo restores it. Starting an empty item and finishing cancels it.
 
-### View and files
+</details>
+
+<details>
+<summary><b>View and export</b></summary>
 
 | Key or action | Result |
 | --- | --- |
@@ -236,14 +306,12 @@ the canvas font in the SVG, which adds about 80 KB.
 The panel scales with the monitor DPI and scrolls when the window is short. Set
 `PAINTBOARD_UI_SCALE=1.5` to scale the panel and the selection handles by hand.
 
+</details>
+
 ## Agents and MCP
 
 Open Paintboard normally, then click **Collaborate: Off** to turn collaboration
 on. The toggle controls both prompted agent access and automatic replies.
-
-```sh
-paintboard notes.pb
-```
 
 - Draw, pause for about 1.5 seconds, and the selected agent will inspect the canvas and add a
   short response in purple text, arrows, or shapes. The panel shows when it is
@@ -258,6 +326,75 @@ paintboard notes.pb
   replies. **Deny** or no answer within 45 seconds refuses the call.
 - Each response is one undo step. Agent edits and Undo/Redo do not trigger
   another automatic reply; the watcher waits for your next drawing edit.
+
+### Connect a chat agent
+
+Connect Codex to the live attachment bridge:
+
+```sh
+codex mcp add paintboard -- paintboard-bridge --mcp
+```
+
+For clients that use an `mcpServers` JSON configuration, such as Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "paintboard": {
+      "command": "/absolute/path/to/paintboard-bridge",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+For a source checkout, use `python3 /absolute/path/to/paintboard-bridge` as the
+server command. The bridge can start before a canvas is open and does not own the
+window: disconnecting a chat leaves the drawing open. It connects over a private
+local Unix socket, with no listening TCP port. If several windows are open, add
+`--board /absolute/path/to/notes.pb` to select one explicitly.
+
+The server also serves a guide for agents, `agent-guide.md`, as the resource
+`paintboard://guide` and the prompt `paintboard_guide`. It covers the workflow,
+coordinates, palette, layout, and an example diagram.
+
+### Scripts and headless use
+
+Scripts do not need their own MCP client. `--call` repeats, and each `--args`
+belongs to the `--call` before it. `--args @FILE` reads the arguments from a
+file, and `--args @-` from stdin. `--file` runs the calls on a board file in a
+headless `paintboard`, with no window:
+
+```sh
+paintboard-bridge --file board.pb \
+  --call add_graph --args @graph.json \
+  --call update_items --args '{"items": [{"id": "ship", "item": {"type": "diamond", "x0": 680, "y0": 80, "x1": 840, "y1": 180, "fill": 1}}]}' \
+  --call export_svg
+```
+
+One call prints indented JSON. Several calls print one line of JSON each. With
+`--file`, the board saves when every call succeeds. A failed call stops the run,
+names the call, and leaves the file as it was. A window that has the file open
+reloads it, as described in [Files and tabs](#use).
+
+Without `--file`, the calls go to the open window, which works without restarting a chat:
+
+```sh
+paintboard-bridge --list
+paintboard-bridge --call get_board
+paintboard-bridge --call get_canvas --image-out /tmp/canvas.png
+```
+
+To get a picture of a board without an agent or a window:
+
+```sh
+paintboard --render notes.pb             # writes notes.png
+paintboard --render notes.pb view.png
+paintboard --render notes.pb view.svg    # vectors; needs no EGL driver
+```
+
+<details>
+<summary><b>Automatic replies and agent settings</b></summary>
 
 The **AUTO REPLY** control cycles through installed **Codex**, **Claude Code**,
 **OpenCode**, and **Chat only** (prompted MCP access without automatic replies).
@@ -275,7 +412,10 @@ canvas image and board data are supplied. Use `PAINTBOARD_CODEX_MODEL`,
 locations. `paintboard-bridge --discover` prints detected paths. Drawing remains
 available if an agent is unavailable; failures appear in the panel and stderr.
 
-### Custom agents
+</details>
+
+<details>
+<summary><b>Custom agents</b></summary>
 
 Click **+** beside AUTO REPLY, enter a launch command, choose a connection mode,
 then **Save & use**. The command is checked for an installed executable and becomes
@@ -325,78 +465,10 @@ back to `~/.config/paintboard/custom-agent.json`. It stores `command` and `trans
 (`acp`, `command`, or `json`), with owner-only file permissions. Sign in using the
 agent's own CLI rather than putting credentials in the command.
 
-Connect Codex to the live attachment bridge:
+</details>
 
-```sh
-codex mcp add paintboard -- paintboard-bridge --mcp
-```
-
-For a source checkout, use `python3 /absolute/path/to/paintboard-bridge` as the
-server command. The bridge can start before a canvas is open and does not own the
-window: disconnecting a chat leaves the drawing open. It connects over a private
-local Unix socket, with no listening TCP port. If several windows are open, add
-`--board /absolute/path/to/notes.pb` to select one explicitly.
-
-The bridge also supports direct calls, which work without restarting a chat:
-
-```sh
-python3 ./paintboard-bridge --list
-python3 ./paintboard-bridge --call get_board
-python3 ./paintboard-bridge --call get_canvas --image-out /tmp/canvas.png
-```
-
-Scripts do not need their own MCP client. `--call` repeats, and each `--args`
-belongs to the `--call` before it. `--args @FILE` reads the arguments from a
-file, and `--args @-` from stdin. `--file` runs the calls on a board file in a
-headless `paintboard`, with no window:
-
-```sh
-paintboard-bridge --file board.pb \
-  --call add_graph --args @graph.json \
-  --call update_items --args '{"items": [{"id": "ship", "item": {"type": "diamond", "x0": 680, "y0": 80, "x1": 840, "y1": 180, "fill": 1}}]}' \
-  --call export_svg
-```
-
-One call prints indented JSON. Several calls print one line of JSON each. With
-`--file`, the board saves when every call succeeds. A failed call stops the run,
-names the call, and leaves the file as it was. A window that has the file open
-reloads it, as described in [Files and tabs](#files-and-tabs).
-
-The binary still supports client-owned stdio sessions and headless automation:
-
-```sh
-paintboard --mcp /absolute/path/to/notes.pb
-paintboard --mcp --headless /absolute/path/to/notes.pb
-```
-
-These explicitly opt in to agent access and own their board session. Use one
-process per board file to avoid competing saves. In headless mode, `get_canvas`
-and `export_png` draw every item, fitted, with no window. That needs an EGL
-OpenGL driver such as Mesa, but no display server. The stdio server writes only
-protocol messages to stdout.
-
-To get a picture of a board without an agent or a window:
-
-```sh
-paintboard --render notes.pb             # writes notes.png
-paintboard --render notes.pb view.png
-paintboard --render notes.pb view.svg    # vectors; needs no EGL driver
-```
-
-For clients that use an `mcpServers` JSON configuration:
-
-```json
-{
-  "mcpServers": {
-    "paintboard": {
-      "command": "/absolute/path/to/paintboard-bridge",
-      "args": ["--mcp"]
-    }
-  }
-}
-```
-
-The server exposes these tools:
+<details>
+<summary><b>MCP tools</b></summary>
 
 | Tool | Purpose |
 | --- | --- |
@@ -417,10 +489,6 @@ The server exposes these tools:
 | `new_board`, `open_board`, `close_tab` | Open and close tabs |
 | `measure_text` | Measure text before placing it |
 
-The server also serves a guide for agents, `agent-guide.md`, as the resource
-`paintboard://guide` and the prompt `paintboard_guide`. It covers the workflow,
-coordinates, palette, layout, and an example diagram.
-
 Start with `get_board` and `get_canvas`. When adding a response to a snapshot,
 pass its `revision` and `collaboration_epoch` to `add_items` so late responses are
 rejected. Items keep their `id` in the file, so a script can name them later:
@@ -430,6 +498,18 @@ by reads and edits. A stale revision is rejected; read the board again before
 retrying. Indices follow paint order and can shift after deletion or undo.
 Edits are rejected while a human is dragging or typing. Each successful batch is
 one undo step, and an invalid batch changes nothing.
+
+Tools act on the active tab, and a tab switch changes the revision. Call
+`save_board` to persist edits explicitly; an Untitled tab has no file to save.
+Closing the window asks about unsaved changes. Disconnecting the attachment
+bridge does not close or save the window. The MCP implementation follows the
+[stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+and [tool protocol](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+
+</details>
+
+<details>
+<summary><b>Graph layout and items</b></summary>
 
 For boxes and arrows, `add_graph` does the layout. It takes `nodes` and `edges`,
 and optional `direction` (`right` or `down`), `x`, `y`, and `elbow`:
@@ -488,41 +568,60 @@ defaults to 3 and text size is seven times the width. Color indices `0`–`7`
 follow the panel palette, and fill `-1` means transparent. Full schemas are
 available through `tools/list`.
 
-Tools act on the active tab, and a tab switch changes the revision. Call
-`save_board` to persist edits explicitly; an Untitled tab has no file to save.
-Closing the window asks about unsaved changes. Closing the client-owned
-`paintboard --mcp` stdin saves every tab that has a file and unsaved changes,
-without a question. It does not replace a file that another program saved
-meanwhile; it reports that on stderr and exits with status 1. `save_board` refuses
-the same case unless you pass `overwrite: true`, and `open_board` with
-`reload: true` loads the new file as one undo step.
-Disconnecting the attachment bridge does not close or save the window. The MCP implementation follows the
-[stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-and [tool protocol](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+</details>
 
+<details>
+<summary><b>Stdio sessions owned by a client</b></summary>
+
+The binary also supports client-owned stdio sessions and headless automation:
+
+```sh
+paintboard --mcp /absolute/path/to/notes.pb
+paintboard --mcp --headless /absolute/path/to/notes.pb
+```
+
+These explicitly opt in to agent access and own their board session. Use one
+process per board file to avoid competing saves. In headless mode, `get_canvas`
+and `export_png` draw every item, fitted, with no window. That needs an EGL
+OpenGL driver such as Mesa, but no display server. The stdio server writes only
+protocol messages to stdout.
+
+Closing the client-owned `paintboard --mcp` stdin saves every tab that has a
+file and unsaved changes, without a question. It does not replace a file that
+another program saved meanwhile; it reports that on stderr and exits with
+status 1. `save_board` refuses the same case unless you pass `overwrite: true`,
+and `open_board` with `reload: true` loads the new file as one undo step.
+
+</details>
+
+<details>
+<summary><b>Tests</b></summary>
+
+`make test` runs the board operations and the MCP stdio tests with no window.
 The protocol tests can also exercise a live display with
 `PAINTBOARD_TEST_LIVE=1 python3 tests/test_mcp.py ./paintboard`.
 `tests/test_collaboration.py` verifies scheduling, cancellation, discovery, and
 the three built-in CLI adapters without making model calls.
 `tests/test_custom_agents.py` verifies command expansion, ACP capabilities,
 streaming, permission denial, timeouts, and stale-response cancellation.
+
 `tests/test_collaboration_live.py` uses X11 and XTest on a private test display
 to exercise the selector, custom setup, saved configuration, and replies. It also
 drives the tabs, the file dialog, the close question, session restore, the
 question before an agent call, reloads after another program saves, labels, and
-containers, and
-saves screenshots to `PAINTBOARD_TEST_ARTIFACTS` (default
+containers. It saves screenshots to `PAINTBOARD_TEST_ARTIFACTS` (default
 `$TMPDIR/paintboard-e2e`). The window must open at 1088 by 870, which a
 1280 by 1024 Xvfb screen gives. In a Wayland session, unset `WAYLAND_DISPLAY`,
 or GLFW opens the test windows on your desktop instead. The real Codex
 smoke test is opt-in with `PAINTBOARD_TEST_REAL_CODEX=1`.
+
+</details>
 
 ## Files
 
 A board is one binary file. The format is described in
 [ARCHITECTURE.md](ARCHITECTURE.md). Paintboard also reads the older `PB02`, `PB03`,
 and `PB04` files and writes them back in the current format, `PB05`.
-
 
 ## Design notes
 

@@ -780,9 +780,12 @@ remains offline.
 
 The source marks its shortcuts with `ponytail:` comments. The ones that matter:
 
-- Immediate mode rendering. Replace with vertex buffers if a board ever gets big
-  enough to drop frames.
-- Whole array undo snapshots. Fine below roughly a hundred thousand items.
+- Immediate mode rendering. A frame of 5,000 items takes about 20 ms of CPU
+  time on a desktop GPU, so such a board redraws at about 50 frames per second
+  while the pointer moves. Replace with vertex buffers if that matters.
+- Whole array undo snapshots. Each step copies the item array at 100 bytes per
+  item, so 256 steps of a 20,000-item board hold about 500 MB. Store changed
+  items only if boards get that big.
 - Bounding box hit testing for closed shapes. Outline testing would be better if
   nested shapes become annoying.
 - Pen points closer than two screen pixels are dropped while drawing. A finished
