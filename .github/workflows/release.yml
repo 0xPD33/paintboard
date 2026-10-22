@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach binaries to, such as v0.5.0
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Ubuntu 22.04 has glibc 2.35, so the binaries run on most current distributions.
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/checkout@v7
+      # An older tag has no build script, so the script always comes from this workflow's commit.
+      - uses: actions/checkout@v7
+        if: inputs.tag
+        with:
+          ref: ${{ inputs.tag }}
+          path: tag
+      - name: Build
+        working-directory: ${{ inputs.tag && 'tag' || '.' }}
+        run: '"$GITHUB_WORKSPACE/.github/build.sh" "$GITHUB_WORKSPACE/dist"'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: paintboard-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release if it does not exist
+        run: |
+          gh release view "$TAG" --repo ${{ github.repository }} > /dev/null ||
+            gh release create "$TAG" --repo ${{ github.repository }} --generate-notes --verify-tag
+      - name: Upload the binaries
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --repo ${{ github.repository }} --clobber
