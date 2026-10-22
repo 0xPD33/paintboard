@@ -1,16 +1,16 @@
 PREFIX ?= /usr/local
 CC ?= cc
 CFLAGS ?= -O2
-CFLAGS += -std=gnu23 -Wall -Wno-unused-function -pthread $(shell pkg-config --cflags glfw3 gl libcjson)
+CFLAGS += -std=gnu23 -Wall -Wno-unused-function -pthread $(shell pkg-config --cflags glfw3 gl egl libcjson)
 CFLAGS += -DPAINTBOARD_PYTHON='"$(or $(shell command -v $(PYTHON)),$(PYTHON))"'
-LDLIBS = $(shell pkg-config --libs glfw3 gl libcjson) -lm -pthread
+LDLIBS = $(shell pkg-config --libs glfw3 gl egl libcjson) -lm -pthread
 PYTHON ?= python3
 
 VENDOR = vendor/stb_truetype.h vendor/stb_image_write.h vendor/Inter.ttf vendor/Excalifont.ttf
 APPS = $(DESTDIR)$(PREFIX)/share/applications
 ICONS = $(DESTDIR)$(PREFIX)/share/icons/hicolor
 
-paintboard: paintboard.c mcp.c collaboration.c mcp-tools.json $(VENDOR)
+paintboard: paintboard.c mcp.c collaboration.c mcp-tools.json agent-guide.md $(VENDOR)
 	$(CC) $(CFLAGS) $(LDFLAGS) paintboard.c $(LDLIBS) -o $@
 
 test: paintboard
@@ -23,6 +23,7 @@ install: paintboard
 	install -Dm755 paintboard $(DESTDIR)$(PREFIX)/bin/paintboard
 	install -Dm755 paintboard-bridge $(DESTDIR)$(PREFIX)/bin/paintboard-bridge
 	install -Dm644 mcp-tools.json $(DESTDIR)$(PREFIX)/share/paintboard/mcp-tools.json
+	install -Dm644 agent-guide.md $(DESTDIR)$(PREFIX)/share/paintboard/agent-guide.md
 	install -Dm644 assets/paintboard.desktop $(APPS)/paintboard.desktop
 	install -Dm644 assets/paintboard.svg $(ICONS)/scalable/apps/paintboard.svg
 	install -Dm644 assets/paintboard.png $(ICONS)/256x256/apps/paintboard.png

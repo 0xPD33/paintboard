@@ -20,17 +20,9 @@ static unsigned discovery_generation;
 static int automatic_requested;
 static int discovery_again, custom_use_pending;
 
-static int custom_config_path(char *out, size_t size) {
-    const char *root = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-    int n;
-    if (root && *root == '/') n = snprintf(out, size, "%s/paintboard/custom-agent.json", root);
-    else if (home && *home == '/') n = snprintf(out, size, "%s/.config/paintboard/custom-agent.json", home);
-    else return 0;
-    return n > 0 && (size_t)n < size;
-}
 static void custom_load(void) {
     char filename[4096], content[16385];
-    if (!custom_config_path(filename, sizeof filename)) return;
+    if (!config_path(filename, sizeof filename, "custom-agent.json")) return;
     FILE *f = fopen(filename, "r"); if (!f) return;
     size_t size = fread(content, 1, sizeof content - 1, f); int failed = ferror(f); fclose(f); content[size] = 0;
     cJSON *config = !failed && size < sizeof content - 1 ? cJSON_Parse(content) : NULL;
@@ -43,25 +35,12 @@ static void custom_load(void) {
     cJSON_Delete(config);
 }
 static int custom_write(void) {
-    char filename[4096], temporary[4120];
-    if (!custom_config_path(filename, sizeof filename)) return 0;
-    for (char *p = filename + 1; *p; p++) if (*p == '/') {
-        *p = 0; int ok = !mkdir(filename, 0700) || errno == EEXIST; *p = '/';
-        if (!ok) return 0;
-    }
-    snprintf(temporary, sizeof temporary, "%s.XXXXXX", filename);
-    int fd = mkstemp(temporary); if (fd < 0) return 0;
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(temporary); return 0; }
     cJSON *config = cJSON_CreateObject();
     cJSON_AddStringToObject(config, "command", custom_draft);
     cJSON_AddStringToObject(config, "transport", custom_transports[custom_draft_transport]);
     char *json = cJSON_PrintUnformatted(config); cJSON_Delete(config);
-    int ok = json && fputs(json, f) >= 0 && fflush(f) == 0;
-    free(json); if (fclose(f)) ok = 0;
-    if (ok && rename(temporary, filename)) ok = 0;
-    if (!ok) unlink(temporary);
-    return ok;
+    int ok = json && config_write("custom-agent.json", json);
+    free(json); return ok;
 }
 
 static void *collaboration_listener(void *unused) {

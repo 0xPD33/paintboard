@@ -114,18 +114,25 @@ def resolve(args):
         return args.socket
     candidates = sessions()
     if args.board:
-        candidates = [s for s in candidates if Path(s["path"]).resolve() == Path(args.board).resolve()]
+        candidates = [s for s in candidates if s.get("path") and Path(s["path"]).resolve() == Path(args.board).resolve()]
     if len(candidates) != 1:
         raise ToolError("Open one Paintboard window, or select it with --board or --socket. Use --list to see windows.")
     return candidates[0]["socket"]
 
 
-def schema():
+def shared(name):
     here = Path(__file__).resolve().parent
-    source = here / "mcp-tools.json"
-    if not source.exists():
-        source = here.parent / "share/paintboard/mcp-tools.json"
-    spec = json.loads(source.read_text())
+    source = here / name
+    return source if source.exists() else here.parent / "share/paintboard" / name
+
+
+GUIDE_URI = "paintboard://guide"
+GUIDE_ENTRY = {"title": "Drawing on Paintboard",
+               "description": "Workflow, coordinates, item types, palette, layout tips, and an example diagram."}
+
+
+def schema():
+    spec = json.loads(shared("mcp-tools.json").read_text())
     tools = copy.deepcopy(spec["tools"])
     for definition in tools:
         if definition["name"] in ("add_items", "update_items"):
@@ -154,8 +161,14 @@ def serve_mcp(args):
                     raise ToolError("Already initialized")
                 requested = request.get("params", {}).get("protocolVersion")
                 version = requested if requested in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2025-11-25"
-                result = {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "paintboard-live", "version": "0.1.0"},
-                          "instructions": "Attach to the user's existing Paintboard. Collaborate must be enabled in its UI. Read get_board and get_canvas before responding; pass their revision and collaboration_epoch to add_items. Respond with editable words and symbols; preserve the user's drawing."}
+                result = {"protocolVersion": version, "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                          "serverInfo": {"name": "paintboard-live", "version": "0.1.0"},
+                          "instructions": "Attach to the user's existing Paintboard. Collaborate must be enabled in its UI. "
+                                          f"The {GUIDE_URI} resource and the paintboard_guide prompt explain coordinates, styles, and layout with an example. "
+                                          "Read get_board and get_canvas before responding; pass their revision and collaboration_epoch to add_items. "
+                                          "In add_items, give shapes an id and a label, and connect them with arrows using from/to. "
+                                          "Tools act on the window's active tab; list_tabs and switch_tab change it. "
+                                          "Respond with editable words and symbols; preserve the user's drawing."}
                 phase = 1
             elif method == "ping":
                 result = {}
@@ -163,6 +176,15 @@ def serve_mcp(args):
                 raise ToolError("Initialize first")
             elif method == "tools/list":
                 result = {"tools": schema()}
+            elif method == "resources/list":
+                result = {"resources": [{"uri": GUIDE_URI, "name": "guide", "mimeType": "text/markdown", **GUIDE_ENTRY}]}
+            elif method == "prompts/list":
+                result = {"prompts": [{"name": "paintboard_guide", **GUIDE_ENTRY}]}
+            elif method == "resources/read" and request.get("params", {}).get("uri") == GUIDE_URI:
+                result = {"contents": [{"uri": GUIDE_URI, "mimeType": "text/markdown", "text": shared("agent-guide.md").read_text()}]}
+            elif method == "prompts/get" and request.get("params", {}).get("name") == "paintboard_guide":
+                text = shared("agent-guide.md").read_text()
+                result = {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
             elif method == "tools/call":
                 try:
                     reply = rpc(resolve(args), method, request.get("params"))

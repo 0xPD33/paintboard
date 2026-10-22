@@ -79,6 +79,49 @@
           }
         },
         "description": "Absolute world-coordinate [x,y] pairs for pen and highlight strokes."
+      },
+      "id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "add_items only: a name that later items in the same batch can use in from/to."
+      },
+      "label": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 65536,
+        "description": "add_items only, for rect, ellipse, diamond, triangle, and star: black text centered on the shape. It becomes a separate text item placed right after the shape."
+      },
+      "label_size": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 64,
+        "default": 3,
+        "description": "Text size of the label, like a text item's width (7 px per unit)."
+      },
+      "from": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "For line and arrow: link the start to this item, given as a board index, or in add_items also the id of an earlier item in the batch. A linked end stops just outside the item's bounding box and follows the item when it moves or resizes. Coordinates for a linked end are optional and are recomputed. get_board reports links as board indices."
+      },
+      "to": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "Link the end of the line or arrow to this item; see from."
       }
     },
     "required": [
@@ -123,8 +166,6 @@
           "properties": {
             "type": {
               "enum": [
-                "line",
-                "arrow",
                 "rect",
                 "ellipse",
                 "diamond",
@@ -142,13 +183,59 @@
             "y1"
           ]
         }
+      },
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "enum": [
+                "line",
+                "arrow"
+              ]
+            }
+          }
+        },
+        "then": {
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "x0",
+                    "y0"
+                  ]
+                },
+                {
+                  "required": [
+                    "from"
+                  ]
+                }
+              ]
+            },
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "x1",
+                    "y1"
+                  ]
+                },
+                {
+                  "required": [
+                    "to"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
       }
     ]
   },
   "tools": [
     {
       "name": "get_status",
-      "description": "Discover the open board, collaboration toggle, human revision, busy state, and agent status. Available even when collaboration is off.",
+      "description": "Discover the active tab's board (path is null for an Untitled tab), the tab count, collaboration toggle, human revision, busy state, and agent status. Available even when collaboration is off.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -186,7 +273,7 @@
     },
     {
       "name": "add_items",
-      "description": "Append up to 1000 items in paint order as one undo step. Returns their indices and the new revision. Defaults: black stroke, width 3, no fill. Text size is width * 7. Does not save automatically; call save_board when finished.",
+      "description": "Append up to 1000 items in paint order as one undo step. Returns their indices, their bounds [x0, y0, x1, y1], and the new revision. Defaults: black stroke, width 3, no fill. Text size is width * 7. Shapes can carry a centered label, and lines or arrows can link to items with from/to instead of coordinates; linked ends follow the items. An invalid item names its position and the reason, and nothing changes. Does not save automatically; call save_board when finished.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -221,7 +308,7 @@
     },
     {
       "name": "update_items",
-      "description": "Replace items at the supplied indices, atomically as one undo step. Supply COMPLETE item definitions, not patches. Use the revision from get_board or the last edit; stale revisions are rejected. Indices must be unique.",
+      "description": "Replace items at the supplied indices, atomically as one undo step. Supply COMPLETE item definitions, not patches. Use the revision from get_board or the last edit; stale revisions are rejected. Indices must be unique. Moving or resizing an item moves the line and arrow ends linked to it. Give from/to again to keep a replaced connector linked.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -265,7 +352,7 @@
     },
     {
       "name": "delete_items",
-      "description": "Delete the listed unique indices as one undo step. Requires the current revision. Remaining indices shift, so inspect the board again afterwards.",
+      "description": "Delete the listed unique indices as one undo step. Requires the current revision. Remaining indices shift, so inspect the board again afterwards. Line and arrow ends linked to a deleted item stay where they are, unlinked.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -339,11 +426,16 @@
     },
     {
       "name": "save_board",
-      "description": "Atomically save to the board path selected when starting the server. Reports a tool error if saving fails.",
+      "description": "Atomically save the active tab. Pass path (absolute, or relative to the server's directory) to save under a new name, as Save As does; an Untitled tab needs it. Refuses a path that another tab has open.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "properties": {}
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
       },
       "annotations": {
         "destructiveHint": true,
@@ -388,7 +480,21 @@
     },
     {
       "name": "export_png",
-      "description": "Export the visible canvas without panel, grid, or selection decorations to a PNG beside the board. Returns its path and an image preview (up to 32 MiB). Requires a live window; unavailable in headless mode.",
+      "description": "Write a PNG beside the active tab's board file and return its path and an image preview (up to 32 MiB). With a window it shows the visible canvas; set_view frames it. Headless, it shows every item, fitted. The tab needs a file; call save_board with a path first.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "export_svg",
+      "description": "Write an SVG of every item, fitted, beside the active tab's board file and return its path. Needs no OpenGL, so it works headless without an EGL driver. Text embeds the canvas font. The tab needs a file; call save_board with a path first.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -402,11 +508,137 @@
     },
     {
       "name": "get_canvas",
-      "description": "Read an image of the live visible canvas, without writing an export file. Returns revision and collaboration epoch with the image. Requires Collaborate on.",
+      "description": "Read an image of the active tab without writing a file. With a window it shows the visible canvas; headless, it shows every item, fitted. Returns revision and collaboration epoch with the image. Requires Collaborate on.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "list_tabs",
+      "description": "List the open tabs: index, path (null when Untitled), active, unsaved changes, and item count. Other tools act on the active tab.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "switch_tab",
+      "description": "Make another tab active. This changes the revision, so read the board again before editing.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tab index from list_tabs."
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "new_board",
+      "description": "Open a new Untitled tab and make it active. Save it with save_board and a path.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "open_board",
+      "description": "Open a board file in a new tab and make it active. A missing file starts an empty board with that path. An open file switches to its tab.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Absolute, or relative to the server's directory."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "close_tab",
+      "description": "Close a tab. A tab with unsaved changes is refused unless discard is true.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tab index from list_tabs."
+          },
+          "discard": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "measure_text",
+      "description": "Measure text in world units before you place it, to size boxes and center labels. Works without Collaborate.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536
+          },
+          "width": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 64,
+            "default": 3,
+            "description": "Text size; 7 px per unit."
+          }
+        },
+        "required": [
+          "text"
+        ]
       },
       "annotations": {
         "readOnlyHint": true,

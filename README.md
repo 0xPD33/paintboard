@@ -13,6 +13,7 @@ Excalidraw is the reference. This is the small offline version of it.
 ## Features
 
 - Freehand pen, marker, line, arrow, rectangle, ellipse, diamond, triangle, star, and text.
+- Lines and arrows that start or end on an item stay linked to it when it moves.
 - Eraser that removes every item it touches. Empty shapes erase only at their outline.
 - Select one item, shift click to add more, or drag a box around a group.
 - Move a selection, or drag a corner handle to resize it.
@@ -21,10 +22,14 @@ Excalidraw is the reference. This is the small offline version of it.
 - Eight stroke colors and eight fill colors.
 - Dot grid with optional snapping.
 - Infinite canvas with pan and zoom.
-- Save to a small binary file. Export the visible canvas to PNG.
+- Several boards in tabs. New, open, save, and save as with a built-in file dialog.
+- Save to a small binary file. Export the visible canvas to PNG, or the whole board to SVG.
+- The open tabs come back when you start Paintboard again.
 - Two fonts are built into the binary, so the program has no font setup.
 - The panel scales with the monitor DPI and scrolls on short windows.
 - MCP server for agents to inspect and edit a live canvas, or work headlessly.
+  Agents get tab tools, labeled shapes, connecting arrows, and a built-in guide.
+- `paintboard --render` draws a whole board to PNG or SVG with no window.
 - Optional collaboration: pause while drawing and Codex, Claude Code, OpenCode,
   or a custom agent replies on the canvas.
 
@@ -79,13 +84,37 @@ tests use Python 3's standard library, included in the development shell.
 ## Use
 
 ```sh
-paintboard              # opens board.pb in the current directory
-paintboard notes.pb     # opens or creates notes.pb
+paintboard                   # reopens the tabs of the last session
+paintboard notes.pb          # opens or creates notes.pb
+paintboard plan.pb map.pb    # opens each board in its own tab
 paintboard --help
 ```
 
-The window opens at 85% of the monitor work area and saves the board when you
-close it.
+The window opens at 85% of the monitor work area. Each board opens in a tab, and
+a dot on a tab marks unsaved changes. When you close a tab or the window, a board
+with unsaved changes asks you to save it, discard the changes, or cancel. With no file arguments, Paintboard reopens the boards
+that were open when you last closed it, or one Untitled board.
+
+### Files and tabs
+
+| Key or action | Result |
+| --- | --- |
+| `Ctrl+N` or `+` on the tab bar | New Untitled board in a new tab |
+| `Ctrl+O` | Open a board |
+| `Ctrl+S` | Save, or Save As for an Untitled board |
+| `Ctrl+Shift+S` | Save As |
+| `Ctrl+W`, the `×` on a tab, or a middle click on a tab | Close the tab |
+| `Ctrl+Tab` or `Ctrl+PgDn` | Next tab |
+| `Ctrl+Shift+Tab` or `Ctrl+PgUp` | Previous tab |
+| `Ctrl+1` to `Ctrl+9` | Go to that tab |
+| `Ctrl+Q` | Close the window |
+
+Open and Save As use a built-in file dialog. It lists the folders and `.pb`
+files in a folder. Click a folder to open it, or click **Up**. Click a file to
+pick it, then double-click it or press `Enter`. You can also type a name, an
+absolute path, or a path that starts with `~/`. Save As adds `.pb` to a name
+with no extension, and asks before it replaces a file. If a board is already
+open, Open switches to its tab. Copy and paste work between tabs.
 
 ### Tools
 
@@ -103,6 +132,11 @@ close it.
 | `T` | Text |
 | `V` | Select |
 | `E` | Eraser |
+
+Start a line or an arrow on an item, or end it on one, to link that end. A
+linked end stays on the item's edge when you move or resize the item. To link an
+existing end, select the line or arrow and drag its corner handle onto an item.
+Moving the line or arrow without its item unlinks that end.
 
 ### Select and edit
 
@@ -159,11 +193,13 @@ are no arrow keys inside a text item yet.
 | Wheel | Zoom at the pointer, or scroll the panel when over it |
 | `Ctrl+=` / `Ctrl+-` | Zoom in / out |
 | `0` | Reset pan and zoom |
-| `Ctrl+S` | Save |
 | `Ctrl+E` | Export a PNG next to the board file |
+| `Ctrl+Shift+E` | Export an SVG next to the board file |
 
 The PNG export writes what the canvas shows right now, without the grid and
 without the tool panel. Pan and zoom to frame the picture before you export it.
+The SVG export always holds the whole board as vectors. A board with text embeds
+the canvas font in the SVG, which adds about 80 KB.
 
 The panel scales with the monitor DPI and scrolls when the window is short. Set
 `PAINTBOARD_UI_SCALE=1.5` to scale the panel and the selection handles by hand.
@@ -281,8 +317,18 @@ paintboard --mcp --headless /absolute/path/to/notes.pb
 ```
 
 These explicitly opt in to agent access and own their board session. Use one
-process per board file to avoid competing saves. Headless mode cannot capture or
-export the live canvas. The stdio server writes only protocol messages to stdout.
+process per board file to avoid competing saves. In headless mode, `get_canvas`
+and `export_png` draw every item, fitted, with no window. That needs an EGL
+OpenGL driver such as Mesa, but no display server. The stdio server writes only
+protocol messages to stdout.
+
+To get a picture of a board without an agent or a window:
+
+```sh
+paintboard --render notes.pb             # writes notes.png
+paintboard --render notes.pb view.png
+paintboard --render notes.pb view.svg    # vectors; needs no EGL driver
+```
 
 For clients that use an `mcpServers` JSON configuration:
 
@@ -301,16 +347,24 @@ The server exposes these tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `get_status` | Discover the window, toggle state, human revision, and whether editing is in progress |
+| `get_status` | Discover the active tab, tab count, toggle state, human revision, and whether editing is in progress |
 | `get_canvas` | Read a canvas image without writing an export file |
 | `get_board` | Read items, bounds, viewport, and the current revision; supports pagination |
-| `add_items` | Add a batch of shapes, pen strokes, or text |
+| `add_items` | Add a batch of shapes, pen strokes, or text, with labels and connecting arrows |
 | `update_items` | Replace complete items at specified indices |
 | `delete_items` | Delete specified indices |
 | `undo`, `redo` | Use the shared human/agent history |
 | `set_view` | Set pan and zoom to frame the drawing |
-| `save_board` | Save to the file chosen at startup |
-| `export_png` | Save the visible canvas and return an image preview |
+| `save_board` | Save the active tab, or Save As with `path` |
+| `export_png` | Save a PNG next to the board and return an image preview |
+| `export_svg` | Save an SVG of the whole board next to the board file |
+| `list_tabs`, `switch_tab` | See the open tabs and change the active one |
+| `new_board`, `open_board`, `close_tab` | Open and close tabs |
+| `measure_text` | Measure text before placing it |
+
+The server also serves a guide for agents, `agent-guide.md`, as the resource
+`paintboard://guide` and the prompt `paintboard_guide`. It covers the workflow,
+coordinates, palette, layout, and an example diagram.
 
 Start with `get_board` and `get_canvas`. When adding a response to a snapshot,
 pass its `revision` and `collaboration_epoch` to `add_items` so late responses are
@@ -325,11 +379,17 @@ For example, the arguments to `add_items` can be:
 ```json
 {
   "items": [
-    {"type": "rect", "x0": 220, "y0": 80, "x1": 480, "y1": 180, "fill": 3},
-    {"type": "text", "x0": 245, "y0": 110, "text": "Agent-created note"}
+    {"type": "rect", "id": "plan", "x0": 220, "y0": 80, "x1": 380, "y1": 140, "fill": 3, "color": 3, "label": "Plan"},
+    {"type": "rect", "id": "build", "x0": 460, "y0": 80, "x1": 620, "y1": 140, "fill": 2, "color": 2, "label": "Build"},
+    {"type": "arrow", "from": "plan", "to": "build"}
   ]
 }
 ```
+
+A `label` adds black text centered on its shape. `from` and `to` take a board
+index or the `id` of an earlier item in the batch, and the arrow's ends stop at
+the two items. The ends stay linked: when the human or `update_items` moves an
+item, its arrows follow. An invalid item names its position and the reason.
 
 Coordinates are world units. At the default view, the tool panel covers the left
 168 logical pixels times the UI scale; `get_board` reports the window size.
@@ -339,9 +399,11 @@ defaults to 3 and text size is seven times the width. Color indices `0`–`7`
 follow the panel palette, and fill `-1` means transparent. Full schemas are
 available through `tools/list`.
 
-Call `save_board` to persist edits explicitly. Closing the window saves; closing
-the client-owned `paintboard --mcp` stdin also saves. Disconnecting the attachment
-bridge does not close or save the window. The MCP implementation follows the
+Tools act on the active tab, and a tab switch changes the revision. Call
+`save_board` to persist edits explicitly; an Untitled tab has no file to save.
+Closing the window asks about unsaved changes. Closing the client-owned
+`paintboard --mcp` stdin saves every tab that has a file, without a question.
+Disconnecting the attachment bridge does not close or save the window. The MCP implementation follows the
 [stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 and [tool protocol](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 
@@ -352,14 +414,19 @@ the three built-in CLI adapters without making model calls.
 `tests/test_custom_agents.py` verifies command expansion, ACP capabilities,
 streaming, permission denial, timeouts, and stale-response cancellation.
 `tests/test_collaboration_live.py` uses X11 and XTest on a private test display
-to exercise the selector, custom setup, saved configuration, and replies. The real Codex
+to exercise the selector, custom setup, saved configuration, and replies. It also
+drives the tabs, the file dialog, the close question, and session restore, and
+saves screenshots to `PAINTBOARD_TEST_ARTIFACTS` (default
+`$TMPDIR/paintboard-e2e`). The window must open at 1088 by 870, which a
+1280 by 1024 Xvfb screen gives. The real Codex
 smoke test is opt-in with `PAINTBOARD_TEST_REAL_CODEX=1`.
 
 ## Files
 
 A board is one binary file. The format is described in
-[ARCHITECTURE.md](ARCHITECTURE.md). Paintboard also reads the older `PB02` files
-and writes them back in the current format.
+[ARCHITECTURE.md](ARCHITECTURE.md). Paintboard also reads the older `PB02` and
+`PB03` files and writes them back in the current format.
+
 
 ## Design notes
 
