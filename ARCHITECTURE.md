@@ -342,7 +342,10 @@ name has no extension. If the file exists, the button changes to "Replace", and 
 second click confirms.
 
 The dialog starts in the folder of the active tab. For an Untitled tab it starts
-in the folder that the dialog used last, and else in `$HOME`.
+in the folder that the dialog used last, and else in the boards folder. The
+boards folder is `$XDG_DOCUMENTS_DIR/Paintboard`, else `~/Documents/Paintboard`.
+Paintboard creates it when needed. MCP tools resolve a relative `path` against
+it, and `--mcp` without FILE uses `board.pb` in it.
 
 ### Messages
 

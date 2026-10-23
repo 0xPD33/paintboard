@@ -720,7 +720,7 @@
     },
     {
       "name": "save_board",
-      "description": "Atomically save the active tab. Pass path (absolute, or relative to the server's directory) to save under a new name, as Save As does; an Untitled tab needs it. Refuses a path that another tab has open. Refuses to replace a file that changed on disk since the tab read or saved it, unless overwrite is true.",
+      "description": "Atomically save the active tab. Pass path (absolute, or relative to ~/Documents/Paintboard) to save under a new name, as Save As does; an Untitled tab needs it. Refuses a path that another tab has open. Refuses to replace a file that changed on disk since the tab read or saved it, unless overwrite is true.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -877,7 +877,7 @@
           "path": {
             "type": "string",
             "minLength": 1,
-            "description": "Absolute, or relative to the server's directory."
+            "description": "Absolute, or relative to ~/Documents/Paintboard."
           },
           "reload": {
             "type": "boolean",

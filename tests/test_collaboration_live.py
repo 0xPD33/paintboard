@@ -233,10 +233,11 @@ print(json.dumps({'annotations':[{'type':'text','x0':400,'y0':250,'text':'Custom
 
     def test_tabs_file_dialog_close_rules_and_session(self):
 
-        # The file dialog starts in $HOME for an Untitled tab; typed names stay lowercase ASCII.
+        # The file dialog starts in the boards folder for an Untitled tab; typed names stay lowercase ASCII.
         with unittest.mock.patch.dict(os.environ, {"HOME": str(self.dir)}):
             self.start()
-        board, second = self.dir / "board.pb", self.dir / "second.pb"
+        boards = self.dir / "Documents/Paintboard"
+        board, second = self.dir / "board.pb", boards / "second.pb"
         self.assertEqual((self.status()["path"], self.status()["tabs"]), (str(board), 1))
         self.draw()
         self.key(ord('n'), control=True)
@@ -253,7 +254,7 @@ print(json.dumps({'annotations':[{'type':'text','x0':400,'y0':250,'text':'Custom
         self.wait(lambda: self.status()["path"] == str(board))
         self.key(0xff09, control=True); self.wait(lambda: self.status()["path"] == str(second))
         self.key(0xff09, control=True); self.wait(lambda: self.status()["path"] == str(board))  # wraps around
-        (self.dir / "bad.pb").write_bytes(b"not a board")
+        (boards / "bad.pb").write_bytes(b"not a board")
         self.key(ord('o'), control=True); self.wait(lambda: self.status()["busy"])
         self.type_command("bad.pb"); self.key(0xff0d)  # a corrupt file fails only that open
         self.wait(lambda: not self.status()["busy"])

@@ -1373,13 +1373,30 @@ static int config_path(char *out, size_t size, const char *name) {
     else return 0;
     return n > 0 && (size_t)n < size;
 }
-static int config_write(const char *name, const char *text) { /* atomic replace; 1 ok */
-    char filename[4096], temporary[4120];
-    if (!config_path(filename, sizeof filename, name)) return 0;
-    for (char *p = filename + 1; *p; p++) if (*p == '/') {
-        *p = 0; int ok = !mkdir(filename, 0700) || errno == EEXIST; *p = '/';
+static int make_parents(char *file) { /* creates every folder above file; 1 ok */
+    for (char *p = file + 1; *p; p++) if (*p == '/') {
+        *p = 0; int ok = !mkdir(file, 0700) || errno == EEXIST; *p = '/';
         if (!ok) return 0;
     }
+    return 1;
+}
+/* boards without a chosen folder go to $XDG_DOCUMENTS_DIR/Paintboard, else ~/Documents/Paintboard */
+static int boards_path(char *out, size_t size, const char *name) {
+    const char *documents = getenv("XDG_DOCUMENTS_DIR"), *home = getenv("HOME");
+    int n;
+    if (documents && *documents == '/') n = snprintf(out, size, "%s/Paintboard/%s", documents, name);
+    else if (home && *home == '/') n = snprintf(out, size, "%s/Documents/Paintboard/%s", home, name);
+    else return 0;
+    return n > 0 && (size_t)n < size;
+}
+static char *board_file(const char *p) { /* an agent's relative path lands in the boards folder */
+    char out[PATH_MAX];
+    if (p[0] != '/' && boards_path(out, sizeof out, p) && make_parents(out)) return strdup(out);
+    return absolute(p);
+}
+static int config_write(const char *name, const char *text) { /* atomic replace; 1 ok */
+    char filename[4096], temporary[4120];
+    if (!config_path(filename, sizeof filename, name) || !make_parents(filename)) return 0;
     snprintf(temporary, sizeof temporary, "%s.XXXXXX", filename);
     int fd = mkstemp(temporary); if (fd < 0) return 0;
     FILE *f = fdopen(fd, "w");
@@ -1566,7 +1583,9 @@ static void fd_open(int mode) {
     const char *home = getenv("HOME"); char *cwd = getcwd(NULL, 0);
     end_edit(); drag = NONE;
     if (path) { snprintf(fd_dir, sizeof fd_dir, "%s", path); *strrchr(fd_dir, '/') = 0; if (!*fd_dir) strcpy(fd_dir, "/"); }
-    else snprintf(fd_dir, sizeof fd_dir, "%s", *last_dir ? last_dir : home && *home == '/' ? home : cwd ? cwd : "/");
+    else if (*last_dir) snprintf(fd_dir, sizeof fd_dir, "%s", last_dir);
+    else if (boards_path(fd_dir, sizeof fd_dir, "") && make_parents(fd_dir)) fd_dir[strlen(fd_dir) - 1] = 0;
+    else snprintf(fd_dir, sizeof fd_dir, "%s", home && *home == '/' ? home : cwd ? cwd : "/");
     free(cwd);
     snprintf(fd_name, sizeof fd_name, "%s", mode == FD_SAVE && path ? base_name(path) : "");
     fd_at = strlen(fd_name); fd_replace = 0; fd_mode = mode; fd_scan();
@@ -2245,7 +2264,7 @@ static void usage(FILE *f) {
         "       paintboard --mcp [--headless] [FILE]\n"
         "       paintboard --render FILE [OUT.png|OUT.svg]\n"
         "  Each FILE opens in a tab; a missing FILE starts an empty board. With no FILE the\n"
-        "  tabs of the last session come back. --mcp uses board.pb when FILE is omitted.\n\n"
+        "  tabs of the last session come back. --mcp uses ~/Documents/Paintboard/board.pb when FILE is omitted.\n\n"
         "  --mcp       expose this canvas to an MCP client over stdin/stdout\n"
         "  --headless  run MCP without a window; images show every item, fitted (needs an EGL driver)\n"
         "  --render    write every item on the board, fitted, with no window: a PNG (needs an EGL driver) or an SVG\n\n"
@@ -2301,7 +2320,7 @@ int main(int argc, char **argv) {
     collaborating = mcp_mode; /* Explicit stdio sessions retain their existing opt-in. */
     if (collaborating) strcpy(collaboration_status, "Agent tools connected");
     if (mcp_mode) { /* an MCP client needs its board, so a bad file stops startup */
-        doc_add(absolute(nfiles ? files[0] : "board.pb"));
+        doc_add(nfiles ? absolute(files[0]) : board_file("board.pb"));
         int loaded = load(0);
         if (loaded) { if (loaded == -1) fprintf(stderr, "%s: not a paintboard file\n", path); return 1; }
     }

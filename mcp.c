@@ -705,10 +705,10 @@ static cJSON *call_tool(const char *name, const cJSON *args) {
     if (!strcmp(name, "new_board") || !strcmp(name, "open_board")) {
         const cJSON *file = field(args, "path"), *again = field(args, "reload"); int opening = !strcmp(name, "open_board");
         if (!keys(args, opening ? "|path|reload|" : "") || (opening && (!cJSON_IsString(file) || !*file->valuestring)) || (again && !cJSON_IsBool(again)))
-            return tool_error(opening ? "Expected path, absolute or relative to the server's directory, and an optional reload." : "This tool takes no arguments.");
+            return tool_error(opening ? "Expected path, absolute or relative to ~/Documents/Paintboard, and an optional reload." : "This tool takes no arguments.");
         if (!opening) doc_add(NULL);
         else {
-            char *target = absolute(file->valuestring); int open = find_tab(target) >= 0; *notice = 0;
+            char *target = board_file(file->valuestring); int open = find_tab(target) >= 0; *notice = 0;
             int failed = open_path(target) || (open && cJSON_IsTrue(again) && reload()); free(target); /* a new tab is fresh already */
             if (failed) return tool_error(notice);
         }
@@ -750,7 +750,7 @@ static cJSON *call_tool(const char *name, const cJSON *args) {
         if (!file && !path) return tool_error("The active tab is Untitled. Pass path to choose its file.");
         char *old = path; Stamp was = disk; int saved;
         if (file) {
-            char *target = absolute(file->valuestring); int other = find_tab(target);
+            char *target = board_file(file->valuestring); int other = find_tab(target);
             if (other >= 0 && other != cur) { free(target); return tool_error("That file is open in another tab."); }
             path = target; disk = (Stamp){0}; /* the stamp belonged to the old file */
         }
