@@ -78,7 +78,7 @@ x86_64 and aarch64 Linux. They need:
 To install for one user, unpack the archive into `~/.local`:
 
 ```sh
-version=0.5.0 arch=$(uname -m)
+version=0.5.1 arch=$(uname -m)
 curl -fL https://github.com/0xPD33/paintboard/releases/download/v$version/paintboard-$version-linux-$arch.tar.gz \
   | tar -xz -C ~/.local --strip-components=1
 ```

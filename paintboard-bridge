@@ -82,7 +82,7 @@ class Headless:
         self.process = subprocess.Popen([command, "--mcp", "--headless", str(board)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.serial = 0
         self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
-                                    "clientInfo": {"name": "paintboard-bridge", "version": "0.5.0"}})
+                                    "clientInfo": {"name": "paintboard-bridge", "version": "0.5.1"}})
         self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 
     def request(self, method, params=None):
@@ -389,7 +389,7 @@ def run_acp(command, directory, prompt, image, current, timeout=120):
         connection = ACPConnection(process, current, timeout)
         try:
             initialized = connection.request("initialize", {"protocolVersion": 1, "clientCapabilities": {},
-                                             "clientInfo": {"name": "paintboard", "version": "0.5.0"}})
+                                             "clientInfo": {"name": "paintboard", "version": "0.5.1"}})
             if initialized.get("protocolVersion") != 1:
                 raise ToolError("This agent does not support ACP v1")
             if not initialized.get("agentCapabilities", {}).get("promptCapabilities", {}).get("image"):

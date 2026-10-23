@@ -2,7 +2,7 @@
 
 stdenv.mkDerivation {
   pname = "paintboard";
-  version = "0.5.0";
+  version = "0.5.1";
 
   src = lib.cleanSourceWith {
     src = ./.;
